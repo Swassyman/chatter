@@ -7,7 +7,6 @@ import (
 	"os"
 
 	"github.com/Swassyman/chatter/transport"
-
 	libp2p "github.com/libp2p/go-libp2p"
 	"github.com/libp2p/go-libp2p/core/peer"
 	"github.com/multiformats/go-multiaddr"
@@ -20,21 +19,23 @@ func main() {
 	if err != nil {
 		log.Fatal(err)
 	}
+	defer host.Close()
+
 	t := transport.NewLibp2pTransport(host)
 	defer t.Close()
 
 	go func() {
 		for msg := range t.Messages() {
-			fmt.Println("Recceived from: ", msg.From)
-			fmt.Println("Received: ", string(msg.Data))
+			fmt.Println("Received communication from:", msg.From)
+			fmt.Println("Received:", string(msg.Data))
 		}
 	}()
 
 	fmt.Println("Node started")
-	fmt.Println("Peer ID: ", host.ID())
+	fmt.Println("Peer ID:", t.PeerID())
 
 	for _, addr := range host.Addrs() {
-		fmt.Printf("Listening: %s/p2p/%s\n ", addr, host.ID())
+		fmt.Printf("Listening: %s/p2p/%s\n", addr, t.PeerID())
 	}
 
 	if len(os.Args) > 1 {
@@ -48,7 +49,8 @@ func main() {
 			log.Fatal(err)
 		}
 
-		fmt.Println("Connecting to : ", info.ID)
+		fmt.Println("Connecting to:", info.ID)
+
 		if err := host.Connect(context.Background(), *info); err != nil {
 			log.Fatal(err)
 		}
@@ -59,6 +61,7 @@ func main() {
 		if err != nil {
 			log.Fatal(err)
 		}
+
 		fmt.Println("Message sent!")
 	}
 
