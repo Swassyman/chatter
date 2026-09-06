@@ -6,13 +6,12 @@ import (
 	"log"
 	"os"
 
+	"github.com/Swassyman/chatter/transport"
+
 	libp2p "github.com/libp2p/go-libp2p"
-	"github.com/libp2p/go-libp2p/core/network"
 	"github.com/libp2p/go-libp2p/core/peer"
 	"github.com/multiformats/go-multiaddr"
 )
-
-const chatProtocol = "/chatter/1.0.0"
 
 func main() {
 	host, err := libp2p.New(
@@ -21,23 +20,15 @@ func main() {
 	if err != nil {
 		log.Fatal(err)
 	}
-	defer host.Close()
+	t := transport.NewLibp2pTransport(host)
+	defer t.Close()
 
-	host.SetStreamHandler(chatProtocol, func(stream network.Stream) {
-		defer stream.Close()
-
-		fmt.Println("Recieved communication from: ", stream.Conn().RemotePeer())
-
-		buf := make([]byte, 1024)
-
-		n, err := stream.Read(buf)
-		if err != nil {
-			log.Println("Error reading: ", err)
-			return
+	go func() {
+		for msg := range t.Messages() {
+			fmt.Println("Recceived from: ", msg.From)
+			fmt.Println("Received: ", string(msg.Data))
 		}
-
-		fmt.Println("Received: ", string(buf[:n]))
-	})
+	}()
 
 	fmt.Println("Node started")
 	fmt.Println("Peer ID: ", host.ID())
@@ -64,21 +55,10 @@ func main() {
 
 		fmt.Println("Connected!")
 
-		stream, err := host.NewStream(
-			context.Background(),
-			info.ID,
-			chatProtocol,
-		)
+		err = t.Send(info.ID, []byte("Hello from Node A"))
 		if err != nil {
 			log.Fatal(err)
 		}
-		defer stream.Close()
-
-		_, err = stream.Write([]byte("Hello from Node A"))
-		if err != nil {
-			log.Fatal(err)
-		}
-
 		fmt.Println("Message sent!")
 	}
 
