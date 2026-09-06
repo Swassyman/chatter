@@ -82,6 +82,10 @@ func (t *Libp2pTransport) Send(to peer.ID, data []byte) error {
 	default:
 	}
 
+	if len(data) > chatter.MAX_MESSAGE_SIZE {
+		return fmt.Errorf("message too large")
+	}
+
 	stream, err := t.host.NewStream(
 		context.Background(),
 		to,

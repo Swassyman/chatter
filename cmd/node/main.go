@@ -57,8 +57,7 @@ func main() {
 
 		fmt.Println("Connected!")
 
-		err = t.Send(info.ID, []byte("Hello from Node A"))
-		if err != nil {
+		if err := t.Send(info.ID, []byte("Hello from Node A")); err != nil {
 			log.Fatal(err)
 		}
 
