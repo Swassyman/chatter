@@ -11,7 +11,6 @@ import (
 )
 
 func TestLibp2pTransportSendReceive(t *testing.T) {
-	// Create Node A
 	hostA, err := libp2p.New(
 		libp2p.ListenAddrStrings("/ip4/127.0.0.1/tcp/0"),
 	)
@@ -20,7 +19,6 @@ func TestLibp2pTransportSendReceive(t *testing.T) {
 	}
 	defer hostA.Close()
 
-	// Create Node B
 	hostB, err := libp2p.New(
 		libp2p.ListenAddrStrings("/ip4/127.0.0.1/tcp/0"),
 	)
@@ -29,12 +27,11 @@ func TestLibp2pTransportSendReceive(t *testing.T) {
 	}
 	defer hostB.Close()
 
-	// Create transports
 	transportA := transport.NewLibp2pTransport(hostA)
 	transportB := transport.NewLibp2pTransport(hostB)
 
-	// Connect A to B
-	err = hostA.Connect(
+	// Connection is explicit.
+	err = transportA.Connect(
 		context.Background(),
 		peer.AddrInfo{
 			ID:    hostB.ID(),
@@ -45,15 +42,12 @@ func TestLibp2pTransportSendReceive(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	// Send message from A to B
 	message := []byte("Hello from Node A")
 
-	err = transportA.Send(hostB.ID(), message)
-	if err != nil {
+	if err := transportA.Send(hostB.ID(), message); err != nil {
 		t.Fatal(err)
 	}
 
-	// Wait for B to receive the message
 	select {
 	case received := <-transportB.Messages():
 		if received.From != hostA.ID() {
@@ -97,7 +91,7 @@ func TestLibp2pTransportSendReceiveReverse(t *testing.T) {
 	transportA := transport.NewLibp2pTransport(hostA)
 	transportB := transport.NewLibp2pTransport(hostB)
 
-	err = hostA.Connect(
+	err = transportA.Connect(
 		context.Background(),
 		peer.AddrInfo{
 			ID:    hostB.ID(),
@@ -110,8 +104,8 @@ func TestLibp2pTransportSendReceiveReverse(t *testing.T) {
 
 	message := []byte("Hello from Node B")
 
-	err = transportB.Send(hostA.ID(), message)
-	if err != nil {
+	// B can now send to A because the connection exists.
+	if err := transportB.Send(hostA.ID(), message); err != nil {
 		t.Fatal(err)
 	}
 
@@ -147,13 +141,69 @@ func TestLibp2pTransportPeerID(t *testing.T) {
 	}
 	defer host.Close()
 
-	transport := transport.NewLibp2pTransport(host)
+	nodeTransport := transport.NewLibp2pTransport(host)
 
-	if transport.PeerID() != host.ID() {
+	if nodeTransport.PeerID() != host.ID() {
 		t.Fatalf(
 			"expected peer ID %s, got %s",
 			host.ID(),
-			transport.PeerID(),
+			nodeTransport.PeerID(),
+		)
+	}
+}
+
+func TestLibp2pTransportPeers(t *testing.T) {
+	hostA, err := libp2p.New(
+		libp2p.ListenAddrStrings("/ip4/127.0.0.1/tcp/0"),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer hostA.Close()
+
+	hostB, err := libp2p.New(
+		libp2p.ListenAddrStrings("/ip4/127.0.0.1/tcp/0"),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer hostB.Close()
+
+	transportA := transport.NewLibp2pTransport(hostA)
+
+	// Initially there should be no connected peers.
+	if peers := transportA.Peers(); len(peers) != 0 {
+		t.Fatalf(
+			"expected 0 peers before connection, got %d",
+			len(peers),
+		)
+	}
+
+	err = transportA.Connect(
+		context.Background(),
+		peer.AddrInfo{
+			ID:    hostB.ID(),
+			Addrs: hostB.Addrs(),
+		},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	peers := transportA.Peers()
+
+	if len(peers) != 1 {
+		t.Fatalf(
+			"expected 1 peer after connection, got %d",
+			len(peers),
+		)
+	}
+
+	if peers[0] != hostB.ID() {
+		t.Fatalf(
+			"expected peer %s, got %s",
+			hostB.ID(),
+			peers[0],
 		)
 	}
 }
@@ -178,7 +228,7 @@ func TestLibp2pTransportMultipleMessages(t *testing.T) {
 	transportA := transport.NewLibp2pTransport(hostA)
 	transportB := transport.NewLibp2pTransport(hostB)
 
-	err = hostA.Connect(
+	err = transportA.Connect(
 		context.Background(),
 		peer.AddrInfo{
 			ID:    hostB.ID(),
@@ -204,19 +254,19 @@ func TestLibp2pTransportMultipleMessages(t *testing.T) {
 	for _, expected := range messages {
 		select {
 		case received := <-transportB.Messages():
-			if string(received.Data) != string(expected) {
-				t.Fatalf(
-					"expected %q, got %q",
-					string(expected),
-					string(received.Data),
-				)
-			}
-
 			if received.From != hostA.ID() {
 				t.Fatalf(
 					"expected sender %s, got %s",
 					hostA.ID(),
 					received.From,
+				)
+			}
+
+			if string(received.Data) != string(expected) {
+				t.Fatalf(
+					"expected %q, got %q",
+					string(expected),
+					string(received.Data),
 				)
 			}
 
@@ -246,7 +296,7 @@ func TestLibp2pTransportLargeMessage(t *testing.T) {
 	transportA := transport.NewLibp2pTransport(hostA)
 	transportB := transport.NewLibp2pTransport(hostB)
 
-	err = hostA.Connect(
+	err = transportA.Connect(
 		context.Background(),
 		peer.AddrInfo{
 			ID:    hostB.ID(),
@@ -263,8 +313,7 @@ func TestLibp2pTransportLargeMessage(t *testing.T) {
 		message[i] = byte(i % 256)
 	}
 
-	err = transportA.Send(hostB.ID(), message)
-	if err != nil {
+	if err := transportA.Send(hostB.ID(), message); err != nil {
 		t.Fatal(err)
 	}
 
@@ -288,14 +337,13 @@ func TestLibp2pTransportSendAfterClose(t *testing.T) {
 	}
 	defer host.Close()
 
-	transport := transport.NewLibp2pTransport(host)
+	nodeTransport := transport.NewLibp2pTransport(host)
 
-	err = transport.Close()
-	if err != nil {
+	if err := nodeTransport.Close(); err != nil {
 		t.Fatal(err)
 	}
 
-	err = transport.Send(
+	err = nodeTransport.Send(
 		host.ID(),
 		[]byte("should fail"),
 	)
@@ -314,13 +362,14 @@ func TestLibp2pTransportCloseTwice(t *testing.T) {
 	}
 	defer host.Close()
 
-	transport := transport.NewLibp2pTransport(host)
+	nodeTransport := transport.NewLibp2pTransport(host)
 
-	if err := transport.Close(); err != nil {
+	if err := nodeTransport.Close(); err != nil {
 		t.Fatal(err)
 	}
 
-	if err := transport.Close(); err != nil {
+	// Close should be safe to call multiple times.
+	if err := nodeTransport.Close(); err != nil {
 		t.Fatal(err)
 	}
 }
@@ -345,7 +394,7 @@ func TestLibp2pTransportEmptyMessage(t *testing.T) {
 	transportA := transport.NewLibp2pTransport(hostA)
 	transportB := transport.NewLibp2pTransport(hostB)
 
-	err = hostA.Connect(
+	err = transportA.Connect(
 		context.Background(),
 		peer.AddrInfo{
 			ID:    hostB.ID(),
@@ -356,8 +405,7 @@ func TestLibp2pTransportEmptyMessage(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	err = transportA.Send(hostB.ID(), []byte{})
-	if err != nil {
+	if err := transportA.Send(hostB.ID(), []byte{}); err != nil {
 		t.Fatal(err)
 	}
 
