@@ -41,6 +41,17 @@ func (t *Libp2pTransport) PeerID() peer.ID {
 	return t.host.ID()
 }
 
+func (t *Libp2pTransport) Connect(
+	ctx context.Context,
+	info peer.AddrInfo,
+) error {
+	return t.host.Connect(ctx, info)
+}
+
+func (t *Libp2pTransport) Peers() []peer.ID {
+	return t.host.Network().Peers()
+}
+
 func (t *Libp2pTransport) handleStream(stream network.Stream) {
 	defer stream.Close()
 

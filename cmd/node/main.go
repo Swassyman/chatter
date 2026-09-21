@@ -2,67 +2,112 @@ package main
 
 import (
 	"context"
-	"fmt"
+	"flag"
 	"log"
-	"os"
+	"strconv"
 
+	api "github.com/Swassyman/chatter/api/http"
 	"github.com/Swassyman/chatter/transport"
-	libp2p "github.com/libp2p/go-libp2p"
+
+	"github.com/libp2p/go-libp2p"
 	"github.com/libp2p/go-libp2p/core/peer"
 	"github.com/multiformats/go-multiaddr"
 )
 
-func main() {
-	host, err := libp2p.New(
-		libp2p.ListenAddrStrings("/ip4/127.0.0.1/tcp/0"),
-	)
+type node struct {
+	transport *transport.Libp2pTransport
+}
+
+func (n *node) ID() string {
+	return n.transport.PeerID().String()
+}
+
+func (n *node) Peers() []api.Peer {
+	peers := n.transport.Peers()
+
+	result := make([]api.Peer, 0, len(peers))
+
+	for _, p := range peers {
+		result = append(result, api.Peer{
+			ID: p.String(),
+		})
+	}
+
+	return result
+}
+
+func (n *node) SendMessage(peerID string, content string) error {
+	to, err := peer.Decode(peerID)
 	if err != nil {
-		log.Fatal(err)
+		return err
+	}
+
+	return n.transport.Send(to, []byte(content))
+}
+
+func (n *node) ConnectPeer(ctx context.Context, address string) error {
+	addr, err := multiaddr.NewMultiaddr(address)
+	if err != nil {
+		return err
+	}
+
+	info, err := peer.AddrInfoFromP2pAddr(addr)
+	if err != nil {
+		return err
+	}
+
+	return n.transport.Connect(ctx, *info)
+}
+
+func main() {
+	port := flag.Int("port", 8080, "HTTP API port")
+	flag.Parse()
+
+	ctx := context.Background()
+
+	host, err := libp2p.New()
+	if err != nil {
+		log.Fatal("failed to create libp2p host:", err)
 	}
 	defer host.Close()
 
-	t := transport.NewLibp2pTransport(host)
-	defer t.Close()
-
-	go func() {
-		for msg := range t.Messages() {
-			fmt.Println("Received communication from:", msg.From)
-			fmt.Println("Received:", string(msg.Data))
-		}
-	}()
-
-	fmt.Println("Node started")
-	fmt.Println("Peer ID:", t.PeerID())
+	log.Println("libp2p node started")
+	log.Println("Peer ID:", host.ID())
 
 	for _, addr := range host.Addrs() {
-		fmt.Printf("Listening: %s/p2p/%s\n", addr, t.PeerID())
+		log.Printf("Listening on: %s/p2p/%s", addr, host.ID())
 	}
 
-	if len(os.Args) > 1 {
-		targetAddr, err := multiaddr.NewMultiaddr(os.Args[1])
-		if err != nil {
-			log.Fatal(err)
-		}
+	nodeTransport := transport.NewLibp2pTransport(host)
 
-		info, err := peer.AddrInfoFromP2pAddr(targetAddr)
-		if err != nil {
-			log.Fatal(err)
-		}
-
-		fmt.Println("Connecting to:", info.ID)
-
-		if err := host.Connect(context.Background(), *info); err != nil {
-			log.Fatal(err)
-		}
-
-		fmt.Println("Connected!")
-
-		if err := t.Send(info.ID, []byte("Hello from Node A")); err != nil {
-			log.Fatal(err)
-		}
-
-		fmt.Println("Message sent!")
+	n := &node{
+		transport: nodeTransport,
 	}
 
-	select {}
+	go func() {
+		for {
+			select {
+			case msg, ok := <-nodeTransport.Messages():
+				if !ok {
+					return
+				}
+
+				log.Printf(
+					"received message from %s: %s",
+					msg.From,
+					string(msg.Data),
+				)
+
+			case <-ctx.Done():
+				return
+			}
+		}
+	}()
+	server := api.NewServer(n)
+
+	log.Printf("HTTP API listening on :%d", *port)
+
+	if err := server.Start(":" + strconv.Itoa(*port)); err != nil {
+		log.Fatal(err)
+	}
 }
