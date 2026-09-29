@@ -1,69 +1,21 @@
 package main
 
 import (
-	"context"
 	"flag"
 	"log"
 	"strconv"
 
 	api "github.com/Swassyman/chatter/api/http"
+	"github.com/Swassyman/chatter/processing"
 	"github.com/Swassyman/chatter/transport"
 
 	"github.com/libp2p/go-libp2p"
-	"github.com/libp2p/go-libp2p/core/peer"
-	"github.com/multiformats/go-multiaddr"
 )
-
-type node struct {
-	transport *transport.Libp2pTransport
-}
-
-func (n *node) ID() string {
-	return n.transport.PeerID().String()
-}
-
-func (n *node) Peers() []api.Peer {
-	peers := n.transport.Peers()
-
-	result := make([]api.Peer, 0, len(peers))
-
-	for _, p := range peers {
-		result = append(result, api.Peer{
-			ID: p.String(),
-		})
-	}
-
-	return result
-}
-
-func (n *node) SendMessage(peerID string, content string) error {
-	to, err := peer.Decode(peerID)
-	if err != nil {
-		return err
-	}
-
-	return n.transport.Send(to, []byte(content))
-}
-
-func (n *node) ConnectPeer(ctx context.Context, address string) error {
-	addr, err := multiaddr.NewMultiaddr(address)
-	if err != nil {
-		return err
-	}
-
-	info, err := peer.AddrInfoFromP2pAddr(addr)
-	if err != nil {
-		return err
-	}
-
-	return n.transport.Connect(ctx, *info)
-}
 
 func main() {
 	port := flag.Int("port", 8080, "HTTP API port")
+	secret := flag.String("secret", "", "shared passphrase for end-to-end payload encryption (all nodes must use the same; empty = plaintext payloads)")
 	flag.Parse()
-
-	ctx := context.Background()
 
 	host, err := libp2p.New()
 	if err != nil {
@@ -73,40 +25,46 @@ func main() {
 
 	log.Println("libp2p node started")
 	log.Println("Peer ID:", host.ID())
-
 	for _, addr := range host.Addrs() {
 		log.Printf("Listening on: %s/p2p/%s", addr, host.ID())
 	}
 
+	// Transport layer
 	nodeTransport := transport.NewLibp2pTransport(host)
+	defer nodeTransport.Close()
 
-	n := &node{
-		transport: nodeTransport,
+	// Processing layer
+	cfg := processing.Config{
+		Net: nodeTransport,
+		Key: host.Peerstore().PrivKey(host.ID()),
 	}
+	if *secret != "" {
+		c, err := processing.NewAESGCM(processing.KeyFromPassphrase(*secret))
+		if err != nil {
+			log.Fatal("cipher:", err)
+		}
+		cfg.Cipher = c
+	}
+	proc, err := processing.New(cfg)
+	if err != nil {
+		log.Fatal("failed to create processor:", err)
+	}
+	proc.Start()
+	defer proc.Stop()
 
+	// The processor is now the ONLY reader of the transport's Messages()
+	// channel. Application-level messages come out of proc.Incoming().
 	go func() {
-		for {
-			select {
-			case msg, ok := <-nodeTransport.Messages():
-				if !ok {
-					return
-				}
-
-				log.Printf(
-					"received message from %s: %s",
-					msg.From,
-					string(msg.Data),
-				)
-
-			case <-ctx.Done():
-				return
-			}
+		for m := range proc.Incoming() {
+			log.Printf("received message from %s (to=%q room=%q): %s",
+				m.From, m.To, m.Room, m.Content)
 		}
 	}()
-	server := api.NewServer(n)
+
+	// Application layer (HTTP API)
+	server := api.NewServer(processing.HTTPNode{P: proc})
 
 	log.Printf("HTTP API listening on :%d", *port)
-
 	if err := server.Start(":" + strconv.Itoa(*port)); err != nil {
 		log.Fatal(err)
 	}
