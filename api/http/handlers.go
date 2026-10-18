@@ -3,6 +3,7 @@ package httpapi
 import (
 	"encoding/json"
 	"net/http"
+	"strconv"
 )
 
 func writeJSON(w http.ResponseWriter, status int, data interface{}) {
@@ -29,8 +30,9 @@ func (s *Server) handleNode(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	writeJSON(w, http.StatusOK, map[string]string{
-		"id": s.node.ID(),
+	writeJSON(w, http.StatusOK, map[string]interface{}{
+		"id":    s.node.ID(),
+		"addrs": s.node.Addrs(),
 	})
 }
 
@@ -59,6 +61,7 @@ func (s *Server) handleMessage(w http.ResponseWriter, r *http.Request) {
 	var req SendMessageRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		http.Error(w, "invalid JSON", http.StatusBadRequest)
+		return
 	}
 
 	if req.PeerID == "" {
@@ -113,5 +116,28 @@ func (s *Server) handleConnectPeer(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]string{
 		"status":  "connected",
 		"address": req.Address,
+	})
+}
+
+func (s *Server) handleMessages(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	afterID := -1
+	if raw := r.URL.Query().Get("after"); raw != "" {
+		parsed, err := strconv.Atoi(raw)
+		if err != nil {
+			http.Error(w, "invalid after param", http.StatusBadRequest)
+			return
+		}
+		afterID = parsed
+	}
+
+	messages := s.store.Since(afterID)
+
+	writeJSON(w, http.StatusOK, map[string]interface{}{
+		"messages": messages,
 	})
 }

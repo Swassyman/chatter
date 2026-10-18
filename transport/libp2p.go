@@ -52,6 +52,18 @@ func (t *Libp2pTransport) Peers() []peer.ID {
 	return t.host.Network().Peers()
 }
 
+// Addrs returns all multiaddrs the host is listening on with the peer ID
+// appended, e.g. /ip4/127.0.0.1/tcp/4001/p2p/<peerID>.
+func (t *Libp2pTransport) Addrs() []string {
+	hostID := t.host.ID()
+	addrs := t.host.Addrs()
+	result := make([]string, 0, len(addrs))
+	for _, addr := range addrs {
+		result = append(result, fmt.Sprintf("%s/p2p/%s", addr, hostID))
+	}
+	return result
+}
+
 func (t *Libp2pTransport) handleStream(stream network.Stream) {
 	defer stream.Close()
 
