@@ -3,6 +3,7 @@ package httpapi
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"net/http"
 	"strconv"
 	"time"
@@ -123,13 +124,20 @@ func (s *Server) handleMessage(w http.ResponseWriter, r *http.Request) {
 	} else {
 		err = s.node.SendMessage(req.PeerID, req.Content)
 	}
-	if err != nil {
+	// No one in range: the node kept the message and sends it when someone is
+	var q interface{ Queued() bool }
+	queued := errors.As(err, &q) && q.Queued()
+	if err != nil && !queued {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
 
-	writeJSON(w, http.StatusOK, map[string]interface{}{
-		"status":  "sent",
+	status, code := "sent", http.StatusOK
+	if queued {
+		status, code = "queued", http.StatusAccepted
+	}
+	writeJSON(w, code, map[string]interface{}{
+		"status":  status,
 		"peer_id": req.PeerID,
 		"content": req.Content,
 		"id":      id,

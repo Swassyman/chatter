@@ -39,12 +39,20 @@ func (h *hub) add(id peer.ID) *fakeNet {
 	return f
 }
 
-func (h *hub) link(a, b peer.ID) { h.links[a][b] = true; h.links[b][a] = true }
+// link locks: the carry loop reads links (via Peers) while tests change them.
+func (h *hub) link(a, b peer.ID) {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	h.links[a][b] = true
+	h.links[b][a] = true
+}
 
 // brokenLink makes a and b look connected while every send between them fails,
 // like a Wi-Fi link that died without closing.
 func (h *hub) brokenLink(a, b peer.ID) {
 	h.link(a, b)
+	h.mu.Lock()
+	defer h.mu.Unlock()
 	h.broken[[2]peer.ID{a, b}] = true
 	h.broken[[2]peer.ID{b, a}] = true
 }
@@ -257,4 +265,66 @@ func TestDeadDirectLinkFallsBackToRelay(t *testing.T) {
 	if m := expect(t, c); m.Content != "still arrives" || m.Via != fb.id.String() {
 		t.Fatalf("bad message: %+v", m)
 	}
+}
+
+func (h *hub) unlink(a, b peer.ID) {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	delete(h.links[a], b)
+	delete(h.links[b], a)
+}
+
+func fastCarry(t *testing.T) {
+	t.Helper()
+	old := carryCheckEvery
+	carryCheckEvery = 20 * time.Millisecond
+	t.Cleanup(func() { carryCheckEvery = old })
+}
+
+// A is alone, so the message waits on A and goes out once C turns up.
+func TestQueuedUntilRecipientInRange(t *testing.T) {
+	fastCarry(t)
+	h := newHub()
+	a, fa := newNode(t, h, nil)
+	c, fc := newNode(t, h, nil)
+
+	err := a.SendTo(c.ID(), "you there?")
+	var q interface{ Queued() bool }
+	if !errors.As(err, &q) || !q.Queued() {
+		t.Fatalf("want a queued error, got %v", err)
+	}
+
+	h.link(fa.id, fc.id)
+	if m := expect(t, c); m.Content != "you there?" || m.From != a.ID() {
+		t.Fatalf("bad message: %+v", m)
+	}
+	expectNothing(t, c) // handed over once, not on every check
+}
+
+// A gives the message to B and leaves; B meets C later and delivers it.
+// The sender doesn't need to be around: the mesh carries the message.
+func TestRelayCarriesMessageAfterSenderLeaves(t *testing.T) {
+	fastCarry(t)
+	h := newHub()
+	key, _ := NewAESGCM(KeyFromPassphrase("test"))
+	a, fa := newNode(t, h, key)
+	b, fb := newNode(t, h, key)
+	c, fc := newNode(t, h, key)
+	h.link(fa.id, fb.id)
+
+	if err := a.SendTo(c.ID(), "meet at the gate"); err != nil {
+		t.Fatal(err)
+	}
+	time.Sleep(100 * time.Millisecond) // B receives and keeps it
+	h.unlink(fa.id, fb.id)
+
+	h.link(fb.id, fc.id)
+	if m := expect(t, c); m.Content != "meet at the gate" || m.From != a.ID() {
+		t.Fatalf("bad message: %+v", m)
+	}
+	expectNothing(t, b) // B only carried it
+
+	// C reconnecting to another carrier later doesn't deliver it again
+	h.link(fa.id, fc.id)
+	expectNothing(t, c)
 }

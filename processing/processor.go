@@ -21,6 +21,33 @@ import (
 
 var ErrNoPeers = errors.New("no connected peers to send to")
 
+// ErrQueued means no one is in range, so the message was kept and will go out
+// when someone is. HTTP callers recognise it by its Queued method (they can't
+// import this package without a cycle).
+var ErrQueued error = queuedError{}
+
+type queuedError struct{}
+
+func (queuedError) Error() string { return "no one in range; the message will be sent when someone is" }
+func (queuedError) Queued() bool  { return true }
+
+// Store, carry, forward: an addressed message that can't be handed straight to
+// its recipient is kept and offered to every neighbour that turns up later,
+// so it hops on until it meets them. Every phone does this, sender and relays
+// alike; there is no server to hold mail.
+const (
+	carryFor   = 24 * time.Hour
+	maxCarried = 500
+)
+
+// How often to look for neighbours that arrived since the last look.
+var carryCheckEvery = 3 * time.Second
+
+type carried struct {
+	env   *Envelope
+	until time.Time
+}
+
 // Network is what the processor needs from the transport layer.
 // *transport.Libp2pTransport already satisfies it; a future BLE transport
 // only has to implement the same methods.
@@ -54,6 +81,10 @@ type Processor struct {
 	seen  *seenCache
 	peers *peerTable
 
+	carryMu sync.Mutex
+	carry   map[string]carried
+	known   map[peer.ID]bool // neighbours at the last carry check; carry loop only
+
 	handleMu sync.RWMutex
 	handle   string
 
@@ -86,13 +117,17 @@ func New(cfg Config) (*Processor, error) {
 		cfg.TTL = DefaultTTL
 	}
 	return &Processor{
-		net:      cfg.Net,
-		key:      cfg.Key,
-		cipher:   cfg.Cipher,
-		store:    cfg.Store,
-		ttl:      cfg.TTL,
-		self:     self,
-		seen:     newSeenCache(10*time.Minute, 10000),
+		net:    cfg.Net,
+		key:    cfg.Key,
+		cipher: cfg.Cipher,
+		store:  cfg.Store,
+		ttl:    cfg.TTL,
+		self:   self,
+		// Remembered as long as messages are carried, so a copy that comes back
+		// round later is still recognised and not delivered twice
+		seen:     newSeenCache(carryFor, 10000),
+		carry:    map[string]carried{},
+		known:    map[peer.ID]bool{},
 		peers:    newPeerTable(),
 		incoming: make(chan ChatMessage, 64),
 		receipts: make(chan Receipt, 64),
@@ -116,6 +151,20 @@ func (p *Processor) Start() {
 					return
 				}
 				p.handleRaw(m)
+			}
+		}
+	}()
+	p.wg.Add(1)
+	go func() {
+		defer p.wg.Done()
+		t := time.NewTicker(carryCheckEvery)
+		defer t.Stop()
+		for {
+			select {
+			case <-p.done:
+				return
+			case <-t.C:
+				p.offerCarried()
 			}
 		}
 	}()
@@ -312,6 +361,7 @@ func (p *Processor) route(env *Envelope, exclude peer.ID) error {
 				if n == target {
 					err := p.net.Send(target, data) // direct hop
 					if err == nil {
+						p.forget(env.ID)
 						return nil
 					}
 					log.Printf("processing: direct send to %s failed (%v); relaying instead", target, err)
@@ -320,6 +370,10 @@ func (p *Processor) route(env *Envelope, exclude peer.ID) error {
 				}
 			}
 		}
+	}
+
+	if env.To != "" {
+		p.keep(env)
 	}
 
 	sent := 0
@@ -335,9 +389,83 @@ func (p *Processor) route(env *Envelope, exclude peer.ID) error {
 		}(n)
 	}
 	if sent == 0 {
+		if env.To != "" {
+			return ErrQueued
+		}
 		return ErrNoPeers
 	}
 	return nil
+}
+
+func (p *Processor) keep(env *Envelope) {
+	p.carryMu.Lock()
+	defer p.carryMu.Unlock()
+	if _, ok := p.carry[env.ID]; ok {
+		return
+	}
+	if len(p.carry) >= maxCarried { // make room by dropping the one closest to expiring
+		var oldest string
+		for id, c := range p.carry {
+			if oldest == "" || c.until.Before(p.carry[oldest].until) {
+				oldest = id
+			}
+		}
+		delete(p.carry, oldest)
+	}
+	p.carry[env.ID] = carried{env: env, until: time.Now().Add(carryFor)}
+}
+
+func (p *Processor) forget(id string) {
+	p.carryMu.Lock()
+	delete(p.carry, id)
+	p.carryMu.Unlock()
+}
+
+// offerCarried hands every kept message to neighbours that weren't connected
+// at the last check. A message handed to its own recipient is done.
+// shortcut: carriers other than the one that met the recipient keep their copy
+// until it expires (the recipient drops repeats); add delivery gossip if
+// carried traffic ever matters.
+func (p *Processor) offerCarried() {
+	current := map[peer.ID]bool{}
+	var fresh []peer.ID
+	for _, n := range p.net.Peers() {
+		current[n] = true
+		if !p.known[n] {
+			fresh = append(fresh, n)
+		}
+	}
+	p.known = current
+	if len(fresh) == 0 {
+		return
+	}
+
+	now := time.Now()
+	var envs []*Envelope
+	p.carryMu.Lock()
+	for id, c := range p.carry {
+		if now.After(c.until) {
+			delete(p.carry, id)
+			continue
+		}
+		envs = append(envs, c.env)
+	}
+	p.carryMu.Unlock()
+
+	for _, env := range envs {
+		data, err := Encode(env)
+		if err != nil {
+			continue
+		}
+		for _, n := range fresh {
+			if n.String() == env.From {
+				continue
+			}
+			if p.net.Send(n, data) == nil && n.String() == env.To {
+				p.forget(env.ID)
+			}
+		}
+	}
 }
 
 // ---------- inbound ----------
@@ -365,7 +493,7 @@ func (p *Processor) handleRaw(m transport.Message) {
 		fwd := *env
 		fwd.TTL--
 		go func() {
-			if err := p.route(&fwd, m.From); err != nil && !errors.Is(err, ErrNoPeers) {
+			if err := p.route(&fwd, m.From); err != nil && !errors.Is(err, ErrNoPeers) && !errors.Is(err, ErrQueued) {
 				log.Printf("processing: relay %s: %v", fwd.ID, err)
 			}
 		}()
