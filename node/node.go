@@ -710,7 +710,7 @@ func Start(cfg Config) (*NodeService, error) {
 					svc.profileMu.Unlock()
 				}
 			case r := <-svc.proc.Receipts():
-				store.AddReceipt(r.From, r.IDs, r.Status)
+				store.AddReceipt(r.From, r.Via, r.IDs, r.Status)
 			case <-ctx.Done():
 				return
 			}

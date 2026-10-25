@@ -24,6 +24,7 @@ type ReceivedReceipt struct {
 	IDs       []string `json:"ids"`
 	Status    string   `json:"status"` // "delivered" or "read"
 	Timestamp string   `json:"timestamp"`
+	Via       string   `json:"via,omitempty"` // neighbour it arrived from; differs from From when relayed
 }
 
 // MessageStore is a thread-safe in-memory store for received messages and
@@ -73,8 +74,9 @@ func (ms *MessageStore) Since(afterID int) []ReceivedMessage {
 	return result
 }
 
-// AddReceipt records a delivery or read receipt from peer `from`.
-func (ms *MessageStore) AddReceipt(from string, ids []string, status string) {
+// AddReceipt records a delivery or read receipt from peer `from` that
+// arrived through neighbour `via`.
+func (ms *MessageStore) AddReceipt(from, via string, ids []string, status string) {
 	ms.mu.Lock()
 	defer ms.mu.Unlock()
 
@@ -84,6 +86,7 @@ func (ms *MessageStore) AddReceipt(from string, ids []string, status string) {
 		IDs:       ids,
 		Status:    status,
 		Timestamp: time.Now().UTC().Format(time.RFC3339),
+		Via:       via,
 	})
 	ms.nextReceiptID++
 }

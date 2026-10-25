@@ -104,8 +104,8 @@ func TestRelayAcrossBluetoothAndWiFi(t *testing.T) {
 	if m.From != c.ID() || m.Via != b.ID() || m.Handle != "carol" || m.Content != "hello alice, via bob" {
 		t.Fatalf("unexpected message at A: %+v", m)
 	}
-	if r := waitForReceipt(t, c, "m-1", "delivered"); r.From != a.ID() {
-		t.Fatalf("delivery receipt from %s, want A", r.From)
+	if r := waitForReceipt(t, c, "m-1", "delivered"); r.From != a.ID() || r.Via != b.ID() {
+		t.Fatalf("delivery receipt from %s via %s, want from A via B", r.From, r.Via)
 	}
 
 	// A -> C: Bluetooth to B, then Wi-Fi to C; then A reads C's message
