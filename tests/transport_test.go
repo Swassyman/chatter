@@ -2,11 +2,14 @@ package tests
 
 import (
 	"context"
+	"io"
 	"testing"
 	"time"
 
+	"github.com/Swassyman/chatter"
 	"github.com/Swassyman/chatter/transport"
 	libp2p "github.com/libp2p/go-libp2p"
+	"github.com/libp2p/go-libp2p/core/network"
 	"github.com/libp2p/go-libp2p/core/peer"
 )
 
@@ -420,5 +423,39 @@ func TestLibp2pTransportEmptyMessage(t *testing.T) {
 
 	case <-time.After(2 * time.Second):
 		t.Fatal("timed out waiting for message")
+	}
+}
+
+// A peer that takes the bytes but never confirms them must not count as a
+// successful send, or messages vanish when a link dies without closing.
+func TestLibp2pTransportSendFailsWithoutAck(t *testing.T) {
+	hostA, err := libp2p.New(libp2p.ListenAddrStrings("/ip4/127.0.0.1/tcp/0"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer hostA.Close()
+	hostB, err := libp2p.New(libp2p.ListenAddrStrings("/ip4/127.0.0.1/tcp/0"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer hostB.Close()
+
+	transportA := transport.NewLibp2pTransport(hostA)
+	// hostB reads everything but never acknowledges
+	hostB.SetStreamHandler(chatter.CHAT_PROTOCOL, func(s network.Stream) {
+		_, _ = io.Copy(io.Discard, s)
+	})
+
+	if err := transportA.Connect(context.Background(), peer.AddrInfo{ID: hostB.ID(), Addrs: hostB.Addrs()}); err != nil {
+		t.Fatal(err)
+	}
+
+	start := time.Now()
+	err = transportA.Send(hostB.ID(), []byte("anyone there?"))
+	if err == nil {
+		t.Fatal("expected Send to fail without an acknowledgement")
+	}
+	if elapsed := time.Since(start); elapsed > 8*time.Second {
+		t.Fatalf("Send took %v to give up", elapsed)
 	}
 }

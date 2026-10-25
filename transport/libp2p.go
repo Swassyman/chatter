@@ -7,11 +7,19 @@ import (
 	"io"
 	"log"
 	"sync"
+	"time"
 
 	"github.com/Swassyman/chatter"
 	"github.com/libp2p/go-libp2p/core/host"
 	"github.com/libp2p/go-libp2p/core/network"
 	"github.com/libp2p/go-libp2p/core/peer"
+)
+
+const (
+	// sendTimeout bounds a whole Send, including waiting for the receiver's ack
+	sendTimeout = 5 * time.Second
+	// ackByte is written back by the receiver once a message has been accepted
+	ackByte = 0x06
 )
 
 type Libp2pTransport struct {
@@ -50,6 +58,16 @@ func (t *Libp2pTransport) Connect(
 
 func (t *Libp2pTransport) Peers() []peer.ID {
 	return t.host.Network().Peers()
+}
+
+// IsConnected reports whether there is a live connection to p.
+func (t *Libp2pTransport) IsConnected(p peer.ID) bool {
+	return t.host.Network().Connectedness(p) == network.Connected
+}
+
+// Disconnect closes every connection to p.
+func (t *Libp2pTransport) Disconnect(p peer.ID) error {
+	return t.host.Network().ClosePeer(p)
 }
 
 // Addrs returns all multiaddrs the host is listening on with the peer ID
@@ -96,6 +114,10 @@ func (t *Libp2pTransport) handleStream(stream network.Stream) {
 	case <-t.done:
 		return
 	}
+
+	// Confirm receipt. Without it, a write into a link that has silently died
+	// (e.g. the peer's Wi-Fi dropped) looks exactly like a successful send.
+	_, _ = stream.Write([]byte{ackByte})
 }
 
 func (t *Libp2pTransport) Send(to peer.ID, data []byte) error {
@@ -109,8 +131,11 @@ func (t *Libp2pTransport) Send(to peer.ID, data []byte) error {
 		return fmt.Errorf("message too large")
 	}
 
+	ctx, cancel := context.WithTimeout(context.Background(), sendTimeout)
+	defer cancel()
+
 	stream, err := t.host.NewStream(
-		context.Background(),
+		ctx,
 		to,
 		chatter.CHAT_PROTOCOL,
 	)
@@ -118,6 +143,7 @@ func (t *Libp2pTransport) Send(to peer.ID, data []byte) error {
 		return err
 	}
 	defer stream.Close()
+	_ = stream.SetDeadline(time.Now().Add(sendTimeout))
 
 	length := make([]byte, 4)
 	binary.BigEndian.PutUint32(length, uint32(len(data)))
@@ -128,6 +154,20 @@ func (t *Libp2pTransport) Send(to peer.ID, data []byte) error {
 
 	if _, err := stream.Write(data); err != nil {
 		return err
+	}
+
+	if err := stream.CloseWrite(); err != nil {
+		return err
+	}
+
+	// The writes above only reached local buffers; wait for the receiver
+	ack := make([]byte, 1)
+	if _, err := io.ReadFull(stream, ack); err != nil {
+		_ = stream.Reset()
+		return fmt.Errorf("no delivery acknowledgement from %s: %w", to, err)
+	}
+	if ack[0] != ackByte {
+		return fmt.Errorf("unexpected acknowledgement %#x from %s", ack[0], to)
 	}
 
 	return nil

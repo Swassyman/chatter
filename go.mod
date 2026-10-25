@@ -2,10 +2,9 @@ module github.com/Swassyman/chatter
 
 go 1.26.5
 
-require (
-	github.com/libp2p/go-libp2p v0.49.0
-	github.com/multiformats/go-multiaddr v0.16.1
-)
+require github.com/libp2p/go-libp2p v0.49.0
+
+require github.com/multiformats/go-multiaddr v0.16.1
 
 require (
 	filippo.io/bigmod v0.1.1-0.20260103110540-f8a47775ebe5 // indirect
