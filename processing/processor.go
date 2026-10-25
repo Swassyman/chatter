@@ -6,6 +6,7 @@ package processing
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"log"
@@ -53,7 +54,11 @@ type Processor struct {
 	seen  *seenCache
 	peers *peerTable
 
+	handleMu sync.RWMutex
+	handle   string
+
 	incoming  chan ChatMessage
+	receipts  chan Receipt
 	done      chan struct{}
 	closeOnce sync.Once
 	wg        sync.WaitGroup
@@ -90,6 +95,7 @@ func New(cfg Config) (*Processor, error) {
 		seen:     newSeenCache(10*time.Minute, 10000),
 		peers:    newPeerTable(),
 		incoming: make(chan ChatMessage, 64),
+		receipts: make(chan Receipt, 64),
 		done:     make(chan struct{}),
 	}, nil
 }
@@ -128,6 +134,22 @@ func (p *Processor) ID() string { return p.self.String() }
 // Incoming delivers messages addressed to this node (or broadcast).
 func (p *Processor) Incoming() <-chan ChatMessage { return p.incoming }
 
+// Receipts delivers delivery/read confirmations for messages we sent.
+func (p *Processor) Receipts() <-chan Receipt { return p.receipts }
+
+// SetHandle sets the display name carried (and signed) in what we send.
+func (p *Processor) SetHandle(handle string) {
+	p.handleMu.Lock()
+	p.handle = handle
+	p.handleMu.Unlock()
+}
+
+func (p *Processor) currentHandle() string {
+	p.handleMu.RLock()
+	defer p.handleMu.RUnlock()
+	return p.handle
+}
+
 // History returns the last `limit` stored messages (0 = all).
 func (p *Processor) History(limit int) ([]ChatMessage, error) { return p.store.List(limit) }
 
@@ -150,15 +172,51 @@ func (p *Processor) SendTo(peerID, content string) error {
 
 // SendDirect sends to one peer; if not a direct neighbour it is relayed via others.
 func (p *Processor) SendDirect(to peer.ID, content string) error {
+	_, err := p.SendDirectWithID(to, "", content)
+	return err
+}
+
+// SendDirectWithID is SendDirect with a caller-chosen message ID (generated
+// when empty), so the caller can match receipts to its own copy. It returns
+// the ID used.
+func (p *Processor) SendDirectWithID(to peer.ID, id, content string) (string, error) {
 	if to == p.self {
-		return errors.New("cannot send a message to yourself")
+		return "", errors.New("cannot send a message to yourself")
 	}
-	return p.publish(to.String(), "", content)
+	return p.publish(id, to.String(), "", content)
 }
 
 // SendRoom broadcasts to everyone reachable (gossip flood, TTL-limited).
 func (p *Processor) SendRoom(room, content string) error {
-	return p.publish("", room, content)
+	_, err := p.publish("", "", room, content)
+	return err
+}
+
+// SendReceipt tells peer `to` that we received or read the given messages.
+// Like any message it is relayed when `to` is not a direct neighbour.
+func (p *Processor) SendReceipt(to string, ids []string, status string) error {
+	target, err := peer.Decode(to)
+	if err != nil {
+		return fmt.Errorf("invalid peer id: %w", err)
+	}
+	if target == p.self {
+		return errors.New("cannot send a receipt to yourself")
+	}
+	if len(ids) == 0 {
+		return errors.New("no message ids")
+	}
+	if status != ReceiptDelivered && status != ReceiptRead {
+		return fmt.Errorf("unknown receipt status %q", status)
+	}
+	body, err := json.Marshal(receiptPayload{IDs: ids, Status: status})
+	if err != nil {
+		return err
+	}
+	env, err := p.newEnvelope("", TypeReceipt, to, "", body)
+	if err != nil {
+		return err
+	}
+	return p.route(env, "")
 }
 
 // ConnectPeer dials a full multiaddr such as /ip4/1.2.3.4/tcp/4001/p2p/12D3Koo...
@@ -181,49 +239,62 @@ func (p *Processor) ConnectPeer(ctx context.Context, address string) error {
 
 // ---------- outbound ----------
 
-func (p *Processor) publish(to, room, content string) error {
+func (p *Processor) publish(id, to, room, content string) (string, error) {
 	if content == "" {
-		return errors.New("empty message")
+		return "", errors.New("empty message")
 	}
-	payload := []byte(content)
+	env, err := p.newEnvelope(id, TypeChat, to, room, []byte(content))
+	if err != nil {
+		return "", err
+	}
+	_ = p.store.Save(ChatMessage{
+		ID: env.ID, From: env.From, To: to, Room: room, Content: content,
+		Timestamp: time.UnixMilli(env.Timestamp), Outgoing: true, Handle: env.Handle,
+	})
+	return env.ID, p.route(env, "")
+}
+
+// newEnvelope builds and signs an envelope authored by this node.
+func (p *Processor) newEnvelope(id string, typ MsgType, to, room string, payload []byte) (*Envelope, error) {
 	if p.cipher != nil {
 		var err error
 		if payload, err = p.cipher.Encrypt(payload); err != nil {
-			return fmt.Errorf("encrypt: %w", err)
+			return nil, fmt.Errorf("encrypt: %w", err)
 		}
 	}
-	id, err := newID()
-	if err != nil {
-		return err
+	if id == "" {
+		var err error
+		if id, err = newID(); err != nil {
+			return nil, err
+		}
+	} else if len(id) > 64 {
+		return nil, errors.New("message id longer than 64 characters")
 	}
 	env := &Envelope{
 		ID:        id,
-		Type:      TypeChat,
+		Type:      typ,
 		From:      p.self.String(),
 		To:        to,
 		Room:      room,
+		Handle:    p.currentHandle(),
 		Timestamp: time.Now().UnixMilli(),
 		TTL:       p.ttl,
 		Payload:   payload,
 	}
 	sb, err := env.signingBytes()
 	if err != nil {
-		return err
+		return nil, err
 	}
 	if env.Sig, err = p.key.Sign(sb); err != nil {
-		return fmt.Errorf("sign: %w", err)
+		return nil, fmt.Errorf("sign: %w", err)
 	}
-
 	p.seen.Seen(env.ID) // so our own message is ignored if it echoes back
-	_ = p.store.Save(ChatMessage{
-		ID: env.ID, From: env.From, To: to, Room: room, Content: content,
-		Timestamp: time.UnixMilli(env.Timestamp), Outgoing: true,
-	})
-	return p.route(env, "")
+	return env, nil
 }
 
 // route sends env to its target if that is a direct neighbour, otherwise floods
-// it to every neighbour except `exclude` and the original author.
+// it to every neighbour except `exclude` and the original author. If the direct
+// hop fails, it falls back to flooding so other paths can still carry it.
 func (p *Processor) route(env *Envelope, exclude peer.ID) error {
 	data, err := Encode(env)
 	if err != nil {
@@ -234,11 +305,18 @@ func (p *Processor) route(env *Envelope, exclude peer.ID) error {
 	}
 	neighbours := p.net.Peers()
 
+	var failedDirect peer.ID
 	if env.To != "" {
 		if target, err := peer.Decode(env.To); err == nil {
 			for _, n := range neighbours {
 				if n == target {
-					return p.net.Send(target, data) // direct hop
+					err := p.net.Send(target, data) // direct hop
+					if err == nil {
+						return nil
+					}
+					log.Printf("processing: direct send to %s failed (%v); relaying instead", target, err)
+					failedDirect = target
+					break
 				}
 			}
 		}
@@ -246,7 +324,7 @@ func (p *Processor) route(env *Envelope, exclude peer.ID) error {
 
 	sent := 0
 	for _, n := range neighbours {
-		if n == p.self || n == exclude || n.String() == env.From {
+		if n == p.self || n == exclude || n == failedDirect || n.String() == env.From {
 			continue
 		}
 		sent++
@@ -281,7 +359,7 @@ func (p *Processor) handleRaw(m transport.Message) {
 
 	self := p.self.String()
 	if env.To == "" || env.To == self {
-		p.deliver(env)
+		p.deliver(env, m.From)
 	}
 	if env.To != self && env.TTL > 1 {
 		fwd := *env
@@ -314,7 +392,7 @@ func verify(env *Envelope) error {
 	return nil
 }
 
-func (p *Processor) deliver(env *Envelope) {
+func (p *Processor) deliver(env *Envelope, via peer.ID) {
 	payload := env.Payload
 	if p.cipher != nil {
 		pt, err := p.cipher.Decrypt(payload)
@@ -324,14 +402,40 @@ func (p *Processor) deliver(env *Envelope) {
 		}
 		payload = pt
 	}
+
+	if env.Type == TypeReceipt {
+		var r receiptPayload
+		if err := json.Unmarshal(payload, &r); err != nil || len(r.IDs) == 0 {
+			log.Printf("processing: bad receipt %s from %s: %v", env.ID, env.From, err)
+			return
+		}
+		select {
+		case p.receipts <- Receipt{From: env.From, IDs: r.IDs, Status: r.Status, Via: via.String()}:
+		default:
+			log.Printf("processing: receipt buffer full, dropped %s", env.ID)
+		}
+		return
+	}
+
 	msg := ChatMessage{
 		ID: env.ID, From: env.From, To: env.To, Room: env.Room,
 		Content: string(payload), Timestamp: time.UnixMilli(env.Timestamp),
+		Handle: env.Handle, Via: via.String(),
 	}
 	_ = p.store.Save(msg)
 	select {
 	case p.incoming <- msg:
 	default:
 		log.Printf("processing: incoming buffer full, dropped %s", env.ID)
+	}
+
+	// Tell the author it arrived. Only for messages addressed to us; nobody
+	// expects receipts for room broadcasts.
+	if env.To == p.self.String() {
+		go func() {
+			if err := p.SendReceipt(env.From, []string{env.ID}, ReceiptDelivered); err != nil && !errors.Is(err, ErrNoPeers) {
+				log.Printf("processing: delivery receipt for %s: %v", env.ID, err)
+			}
+		}()
 	}
 }

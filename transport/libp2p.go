@@ -60,6 +60,16 @@ func (t *Libp2pTransport) Peers() []peer.ID {
 	return t.host.Network().Peers()
 }
 
+// IsConnected reports whether there is a live connection to p.
+func (t *Libp2pTransport) IsConnected(p peer.ID) bool {
+	return t.host.Network().Connectedness(p) == network.Connected
+}
+
+// Disconnect closes every connection to p.
+func (t *Libp2pTransport) Disconnect(p peer.ID) error {
+	return t.host.Network().ClosePeer(p)
+}
+
 // Addrs returns all multiaddrs the host is listening on with the peer ID
 // appended, e.g. /ip4/127.0.0.1/tcp/4001/p2p/<peerID>.
 func (t *Libp2pTransport) Addrs() []string {

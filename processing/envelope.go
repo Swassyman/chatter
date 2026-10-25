@@ -13,6 +13,20 @@ type MsgType string
 
 const (
 	TypeChat MsgType = "chat"
+	// TypeReceipt confirms chat messages were delivered or read; its payload
+	// is a receiptPayload.
+	TypeReceipt MsgType = "receipt"
+)
+
+// receiptPayload is the body of a TypeReceipt envelope.
+type receiptPayload struct {
+	IDs    []string `json:"ids"`
+	Status string   `json:"status"` // ReceiptDelivered or ReceiptRead
+}
+
+const (
+	ReceiptDelivered = "delivered"
+	ReceiptRead      = "read"
 )
 
 const (
@@ -30,6 +44,7 @@ type Envelope struct {
 	From      string  `json:"from"`           // ORIGINAL author's peer ID
 	To        string  `json:"to,omitempty"`   // target peer ID; empty = broadcast
 	Room      string  `json:"room,omitempty"` // chat room name (broadcast)
+	Handle    string  `json:"handle,omitempty"` // author's display name
 	Timestamp int64   `json:"ts"`             // unix millis
 	TTL       int     `json:"ttl"`            // remaining hops
 	Payload   []byte  `json:"payload"`        // content (AES-GCM ciphertext if a Cipher is set)
@@ -53,9 +68,10 @@ func (e *Envelope) signingBytes() ([]byte, error) {
 		From      string
 		To        string
 		Room      string
+		Handle    string
 		Timestamp int64
 		Payload   []byte
-	}{e.ID, e.Type, e.From, e.To, e.Room, e.Timestamp, e.Payload})
+	}{e.ID, e.Type, e.From, e.To, e.Room, e.Handle, e.Timestamp, e.Payload})
 }
 
 func Encode(e *Envelope) ([]byte, error) { return json.Marshal(e) }
@@ -71,7 +87,7 @@ func Decode(b []byte) (*Envelope, error) {
 		return nil, errors.New("invalid envelope id")
 	case e.From == "":
 		return nil, errors.New("envelope has no sender")
-	case e.Type != TypeChat:
+	case e.Type != TypeChat && e.Type != TypeReceipt:
 		return nil, fmt.Errorf("unknown message type %q", e.Type)
 	case e.TTL < 0 || e.TTL > MaxTTL:
 		return nil, fmt.Errorf("invalid ttl %d", e.TTL)

@@ -20,6 +20,7 @@ import (
 
 	"github.com/Swassyman/chatter"
 	api "github.com/Swassyman/chatter/api/http"
+	"github.com/Swassyman/chatter/processing"
 	"github.com/Swassyman/chatter/transport"
 
 	"github.com/libp2p/go-libp2p"
@@ -61,12 +62,18 @@ type Config struct {
 	DataDir  string // Directory where identity.key and node state are stored
 	HTTPPort int    // Local HTTP API port (default: 8080)
 	P2PPort  int    // libp2p listen TCP port (default: 4001)
+
+	// DisableMDNS turns off LAN auto-discovery, e.g. so tests control topology
+	DisableMDNS bool
 }
 
 // NodeService encapsulates the libp2p host, transport, message store, HTTP server, and mDNS discovery.
 type NodeService struct {
 	host       host.Host
 	transport  *transport.Libp2pTransport
+	bridge     *transport.BluetoothBridge
+	mesh       *transport.MeshNetwork
+	proc       *processing.Processor
 	store      *api.MessageStore
 	server     *api.Server
 	httpServer *http.Server
@@ -201,24 +208,58 @@ func (s *NodeService) Peers() []api.Peer {
 }
 
 func (s *NodeService) SendMessage(peerID string, content string) error {
+	_, err := s.SendChat(peerID, "", content)
+	return err
+}
+
+// SendChat sends content to peerID under msgID (generated when empty) and
+// returns the ID used. Without a direct Wi-Fi or Bluetooth link, the message
+// is relayed through whichever peers are connected.
+func (s *NodeService) SendChat(peerID, msgID, content string) (string, error) {
 	to, err := peer.Decode(peerID)
 	if err != nil {
-		return err
+		return "", err
 	}
 	if len(content) > chatter.MAX_MESSAGE_SIZE {
-		return fmt.Errorf("message too large")
+		return "", fmt.Errorf("message too large")
 	}
-	if err := s.transport.Send(to, []byte(content)); err != nil {
-		// A connected peer that can't take (or acknowledge) a message is most
-		// likely gone, e.g. its Wi-Fi dropped. Close the link so /peers shows it
-		// right away instead of after TCP gives up.
-		if s.host.Network().Connectedness(to) == network.Connected {
-			log.Printf("Send to %s failed (%v); closing connection", to, err)
-			_ = s.host.Network().ClosePeer(to)
+	return s.proc.SendDirectWithID(to, msgID, content)
+}
+
+// SendReceipt tells peerID that we received or read the given messages.
+func (s *NodeService) SendReceipt(peerID string, msgIDs []string, status string) error {
+	return s.proc.SendReceipt(peerID, msgIDs, status)
+}
+
+// SetBluetoothPeers records which peers the app currently has Bluetooth links to.
+func (s *NodeService) SetBluetoothPeers(ids []string) {
+	peers := make([]peer.ID, 0, len(ids))
+	for _, id := range ids {
+		if pid, err := peer.Decode(id); err == nil {
+			peers = append(peers, pid)
 		}
-		return err
 	}
-	return nil
+	s.bridge.SetNeighbors(peers)
+}
+
+// BluetoothOutbox waits (until ctx ends) for frames the app should carry
+// over its Bluetooth links.
+func (s *NodeService) BluetoothOutbox(ctx context.Context) []api.BridgeFrame {
+	frames := s.bridge.Outgoing(ctx)
+	out := make([]api.BridgeFrame, 0, len(frames))
+	for _, f := range frames {
+		out = append(out, api.BridgeFrame{To: f.To.String(), Data: f.Data})
+	}
+	return out
+}
+
+// BluetoothInbox hands the mesh a frame the app received over Bluetooth.
+func (s *NodeService) BluetoothInbox(from string, data []byte) error {
+	pid, err := peer.Decode(from)
+	if err != nil {
+		return fmt.Errorf("invalid peer id: %w", err)
+	}
+	return s.bridge.Deliver(pid, data)
 }
 
 // Handle returns this node's user-chosen display name.
@@ -237,6 +278,7 @@ func (s *NodeService) SetHandle(handle string) error {
 	s.profileMu.Lock()
 	s.handle = handle
 	s.profileMu.Unlock()
+	s.proc.SetHandle(handle) // carried, signed, in every message we send
 
 	for _, p := range s.host.Network().Peers() {
 		go s.sendProfile(p)
@@ -607,9 +649,24 @@ func Start(cfg Config) (*NodeService, error) {
 	nodeTransport := transport.NewLibp2pTransport(h)
 	store := api.NewMessageStore()
 
+	// Route over Wi-Fi and the app's Bluetooth links alike, relaying through
+	// other peers when there is no direct link
+	bridge := transport.NewBluetoothBridge()
+	mesh := transport.NewMeshNetwork(nodeTransport, bridge)
+	proc, err := processing.New(processing.Config{Net: mesh, Key: privKey})
+	if err != nil {
+		h.Close()
+		cancel()
+		return nil, fmt.Errorf("failed to create processor: %w", err)
+	}
+	proc.Start()
+
 	svc := &NodeService{
 		host:        h,
 		transport:   nodeTransport,
+		bridge:      bridge,
+		mesh:        mesh,
+		proc:        proc,
 		store:       store,
 		p2pPort:     cfg.P2PPort,
 		cancel:      cancel,
@@ -627,24 +684,33 @@ func Start(cfg Config) (*NodeService, error) {
 	go svc.monitorPeers(ctx)
 
 	// Initialize and start mDNS peer auto-discovery for local Wi-Fi / Hotspot
-	notifee := &mdnsNotifee{h: h, ctx: ctx}
-	svc.mdnsSvc = mdns.NewMdnsService(h, "chatter-mesh", notifee)
-	if err := svc.mdnsSvc.Start(); err != nil {
-		log.Printf("mDNS start notice (non-fatal): %v", err)
-	} else {
-		log.Printf("mDNS auto-discovery active on local network (service: chatter-mesh)")
+	if !cfg.DisableMDNS {
+		notifee := &mdnsNotifee{h: h, ctx: ctx}
+		svc.mdnsSvc = mdns.NewMdnsService(h, "chatter-mesh", notifee)
+		if err := svc.mdnsSvc.Start(); err != nil {
+			log.Printf("mDNS start notice (non-fatal): %v", err)
+		} else {
+			log.Printf("mDNS auto-discovery active on local network (service: chatter-mesh)")
+		}
 	}
 
-	// Message logging and storing goroutine
+	// The processing layer is the only reader of the network: it verifies,
+	// dedups and relays envelopes, handing over what is addressed to us
 	go func() {
 		for {
 			select {
-			case msg, ok := <-nodeTransport.Messages():
-				if !ok {
-					return
+			case m := <-svc.proc.Incoming():
+				log.Printf("Received message %s from %s via %s", m.ID, m.From, m.Via)
+				store.AddMessage(api.ReceivedMessage{
+					From: m.From, Content: m.Content, MsgID: m.ID, Handle: m.Handle, Via: m.Via,
+				})
+				if pid, err := peer.Decode(m.From); err == nil && m.Handle != "" {
+					svc.profileMu.Lock()
+					svc.peerHandles[pid] = m.Handle
+					svc.profileMu.Unlock()
 				}
-				log.Printf("Received P2P message from %s: %s", msg.From, string(msg.Data))
-				svc.AddIncomingMessage(msg.From.String(), string(msg.Data))
+			case r := <-svc.proc.Receipts():
+				store.AddReceipt(r.From, r.IDs, r.Status)
 			case <-ctx.Done():
 				return
 			}
@@ -696,6 +762,12 @@ func (s *NodeService) Stop() error {
 			ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 			defer cancel()
 			s.httpServer.Shutdown(ctx)
+		}
+		if s.proc != nil {
+			s.proc.Stop()
+		}
+		if s.mesh != nil {
+			s.mesh.Close()
 		}
 		if s.transport != nil {
 			s.transport.Close()

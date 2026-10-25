@@ -16,9 +16,10 @@ import (
 // ---- in-memory fake network: lets us test multi-hop without real sockets ----
 
 type hub struct {
-	mu    sync.Mutex
-	nodes map[peer.ID]*fakeNet
-	links map[peer.ID]map[peer.ID]bool
+	mu     sync.Mutex
+	nodes  map[peer.ID]*fakeNet
+	links  map[peer.ID]map[peer.ID]bool
+	broken map[[2]peer.ID]bool // listed as neighbours, but sends fail
 }
 
 type fakeNet struct {
@@ -28,7 +29,7 @@ type fakeNet struct {
 }
 
 func newHub() *hub {
-	return &hub{nodes: map[peer.ID]*fakeNet{}, links: map[peer.ID]map[peer.ID]bool{}}
+	return &hub{nodes: map[peer.ID]*fakeNet{}, links: map[peer.ID]map[peer.ID]bool{}, broken: map[[2]peer.ID]bool{}}
 }
 
 func (h *hub) add(id peer.ID) *fakeNet {
@@ -39,6 +40,14 @@ func (h *hub) add(id peer.ID) *fakeNet {
 }
 
 func (h *hub) link(a, b peer.ID) { h.links[a][b] = true; h.links[b][a] = true }
+
+// brokenLink makes a and b look connected while every send between them fails,
+// like a Wi-Fi link that died without closing.
+func (h *hub) brokenLink(a, b peer.ID) {
+	h.link(a, b)
+	h.broken[[2]peer.ID{a, b}] = true
+	h.broken[[2]peer.ID{b, a}] = true
+}
 
 func (f *fakeNet) PeerID() peer.ID                              { return f.id }
 func (f *fakeNet) Messages() <-chan transport.Message           { return f.msgs }
@@ -55,7 +64,7 @@ func (f *fakeNet) Peers() []peer.ID {
 }
 func (f *fakeNet) Send(to peer.ID, data []byte) error {
 	f.hub.mu.Lock()
-	ok := f.hub.links[f.id][to]
+	ok := f.hub.links[f.id][to] && !f.hub.broken[[2]peer.ID{f.id, to}]
 	dst := f.hub.nodes[to]
 	f.hub.mu.Unlock()
 	if !ok {
@@ -164,5 +173,88 @@ func TestNoPeers(t *testing.T) {
 	a, _ := newNode(t, h, nil)
 	if err := a.SendRoom("r", "x"); !errors.Is(err, ErrNoPeers) {
 		t.Fatalf("want ErrNoPeers, got %v", err)
+	}
+}
+
+func expectReceipt(t *testing.T, p *Processor) Receipt {
+	t.Helper()
+	select {
+	case r := <-p.Receipts():
+		return r
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for receipt")
+		return Receipt{}
+	}
+}
+
+// A -- B -- C: C confirms delivery automatically, the receipt is relayed
+// back to A, and A can tell which message it was about.
+func TestDeliveryAndReadReceiptsAcrossRelay(t *testing.T) {
+	h := newHub()
+	a, fa := newNode(t, h, nil)
+	_, fb := newNode(t, h, nil)
+	c, fc := newNode(t, h, nil)
+	h.link(fa.id, fb.id)
+	h.link(fb.id, fc.id)
+
+	id, err := a.SendDirectWithID(fc.id, "msg-1", "hi C")
+	if err != nil || id != "msg-1" {
+		t.Fatalf("send: id=%q err=%v", id, err)
+	}
+	expect(t, c)
+
+	r := expectReceipt(t, a)
+	if r.From != c.ID() || r.Status != ReceiptDelivered || len(r.IDs) != 1 || r.IDs[0] != "msg-1" {
+		t.Fatalf("bad delivery receipt: %+v", r)
+	}
+	if r.Via != fb.id.String() {
+		t.Fatalf("receipt should arrive via B, got via %s", r.Via)
+	}
+
+	if err := c.SendReceipt(a.ID(), []string{"msg-1"}, ReceiptRead); err != nil {
+		t.Fatal(err)
+	}
+	if r := expectReceipt(t, a); r.Status != ReceiptRead || r.IDs[0] != "msg-1" {
+		t.Fatalf("bad read receipt: %+v", r)
+	}
+}
+
+func TestMessageCarriesSignedHandleAndHop(t *testing.T) {
+	h := newHub()
+	a, fa := newNode(t, h, nil)
+	_, fb := newNode(t, h, nil)
+	c, fc := newNode(t, h, nil)
+	h.link(fa.id, fb.id)
+	h.link(fb.id, fc.id)
+
+	a.SetHandle("alice")
+	if err := a.SendTo(c.ID(), "hello"); err != nil {
+		t.Fatal(err)
+	}
+	m := expect(t, c)
+	if m.Handle != "alice" {
+		t.Fatalf("handle = %q, want alice", m.Handle)
+	}
+	if m.From != a.ID() || m.Via != fb.id.String() {
+		t.Fatalf("from=%s via=%s, want from A via B", m.From, m.Via)
+	}
+}
+
+// A's direct link to C looks up but is dead: the message must still get to
+// C through B rather than fail.
+func TestDeadDirectLinkFallsBackToRelay(t *testing.T) {
+	h := newHub()
+	a, fa := newNode(t, h, nil)
+	_, fb := newNode(t, h, nil)
+	c, fc := newNode(t, h, nil)
+	h.link(fa.id, fb.id)
+	h.link(fb.id, fc.id)
+	h.brokenLink(fa.id, fc.id)
+
+	if err := a.SendTo(c.ID(), "still arrives"); err != nil {
+		t.Fatal(err)
+	}
+	if m := expect(t, c); m.Content != "still arrives" || m.Via != fb.id.String() {
+		t.Fatalf("bad message: %+v", m)
 	}
 }

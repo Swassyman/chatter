@@ -14,6 +14,16 @@ type ChatMessage struct {
 	Content   string
 	Timestamp time.Time
 	Outgoing  bool
+	Handle    string // author's display name, as signed by the author
+	Via       string // neighbour it arrived from; differs from From when relayed
+}
+
+// Receipt reports that peer From received or read our messages IDs.
+type Receipt struct {
+	From   string
+	IDs    []string
+	Status string // ReceiptDelivered or ReceiptRead
+	Via    string
 }
 
 // MessageStore is the "store / retrieve from local storage" box.
