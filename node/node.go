@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"io"
 	"log"
 	"math/rand"
 	"net"
@@ -15,7 +16,9 @@ import (
 	"strings"
 	"sync"
 	"time"
+	"unicode/utf8"
 
+	"github.com/Swassyman/chatter"
 	api "github.com/Swassyman/chatter/api/http"
 	"github.com/Swassyman/chatter/transport"
 
@@ -28,6 +31,7 @@ import (
 	"github.com/libp2p/go-libp2p/p2p/discovery/mdns"
 	"github.com/libp2p/go-libp2p/p2p/muxer/yamux"
 	"github.com/libp2p/go-libp2p/p2p/net/swarm"
+	"github.com/libp2p/go-libp2p/p2p/protocol/ping"
 	"github.com/libp2p/go-libp2p/p2p/security/insecure"
 	"github.com/libp2p/go-libp2p/p2p/security/noise"
 	"github.com/libp2p/go-libp2p/p2p/transport/tcp"
@@ -35,6 +39,22 @@ import (
 )
 
 var macRegex = regexp.MustCompile(`^([0-9A-Fa-f]{2}[:-]){5}([0-9A-Fa-f]{2})$`)
+
+const (
+	// profileProtocol carries a peer's handle, pushed when a connection comes up
+	profileProtocol = "/chatter/profile/1.0.0"
+	maxHandleLen    = 32
+
+	// Liveness: connected peers are pinged every peerCheckInterval, and a peer
+	// that misses peerMaxPingFailures pings in a row is disconnected
+	peerCheckInterval   = 3 * time.Second
+	peerPingTimeout     = 2500 * time.Millisecond
+	peerMaxPingFailures = 2
+)
+
+type profile struct {
+	Handle string `json:"handle"`
+}
 
 // Config defines the startup configuration for a Chatter node.
 type Config struct {
@@ -56,6 +76,10 @@ type NodeService struct {
 	cancel     context.CancelFunc
 	done       chan struct{}
 	closeOnce  sync.Once
+
+	profileMu   sync.RWMutex
+	handle      string
+	peerHandles map[peer.ID]string
 }
 
 type mdnsNotifee struct {
@@ -165,9 +189,12 @@ func (s *NodeService) Addrs() []string {
 func (s *NodeService) Peers() []api.Peer {
 	peers := s.transport.Peers()
 	result := make([]api.Peer, 0, len(peers))
+	s.profileMu.RLock()
+	defer s.profileMu.RUnlock()
 	for _, p := range peers {
 		result = append(result, api.Peer{
-			ID: p.String(),
+			ID:     p.String(),
+			Handle: s.peerHandles[p],
 		})
 	}
 	return result
@@ -178,7 +205,134 @@ func (s *NodeService) SendMessage(peerID string, content string) error {
 	if err != nil {
 		return err
 	}
-	return s.transport.Send(to, []byte(content))
+	if len(content) > chatter.MAX_MESSAGE_SIZE {
+		return fmt.Errorf("message too large")
+	}
+	if err := s.transport.Send(to, []byte(content)); err != nil {
+		// A connected peer that can't take (or acknowledge) a message is most
+		// likely gone, e.g. its Wi-Fi dropped. Close the link so /peers shows it
+		// right away instead of after TCP gives up.
+		if s.host.Network().Connectedness(to) == network.Connected {
+			log.Printf("Send to %s failed (%v); closing connection", to, err)
+			_ = s.host.Network().ClosePeer(to)
+		}
+		return err
+	}
+	return nil
+}
+
+// Handle returns this node's user-chosen display name.
+func (s *NodeService) Handle() string {
+	s.profileMu.RLock()
+	defer s.profileMu.RUnlock()
+	return s.handle
+}
+
+// SetHandle sets this node's display name and pushes it to connected peers.
+func (s *NodeService) SetHandle(handle string) error {
+	handle = strings.TrimSpace(handle)
+	if utf8.RuneCountInString(handle) > maxHandleLen {
+		return fmt.Errorf("handle is longer than %d characters", maxHandleLen)
+	}
+	s.profileMu.Lock()
+	s.handle = handle
+	s.profileMu.Unlock()
+
+	for _, p := range s.host.Network().Peers() {
+		go s.sendProfile(p)
+	}
+	return nil
+}
+
+func (s *NodeService) sendProfile(p peer.ID) {
+	handle := s.Handle()
+	if handle == "" {
+		return
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	stream, err := s.host.NewStream(ctx, p, profileProtocol)
+	if err != nil {
+		log.Printf("Profile push to %s failed: %v", p, err)
+		return
+	}
+	defer stream.Close()
+	_ = stream.SetDeadline(time.Now().Add(5 * time.Second))
+	if err := json.NewEncoder(stream).Encode(profile{Handle: handle}); err != nil {
+		log.Printf("Profile push to %s failed: %v", p, err)
+	}
+}
+
+func (s *NodeService) handleProfileStream(stream network.Stream) {
+	defer stream.Close()
+	_ = stream.SetDeadline(time.Now().Add(5 * time.Second))
+
+	var p profile
+	if err := json.NewDecoder(io.LimitReader(stream, 4096)).Decode(&p); err != nil {
+		log.Printf("Bad profile from %s: %v", stream.Conn().RemotePeer(), err)
+		return
+	}
+	handle := strings.TrimSpace(p.Handle)
+	if handle == "" || utf8.RuneCountInString(handle) > maxHandleLen {
+		return
+	}
+	s.profileMu.Lock()
+	s.peerHandles[stream.Conn().RemotePeer()] = handle
+	s.profileMu.Unlock()
+}
+
+// monitorPeers pings connected peers and closes links that stop answering, so
+// a peer whose Wi-Fi went away drops out of /peers within seconds rather than
+// lingering until TCP times out.
+func (s *NodeService) monitorPeers(ctx context.Context) {
+	failures := make(map[peer.ID]int)
+	ticker := time.NewTicker(peerCheckInterval)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+		}
+
+		peers := s.host.Network().Peers()
+		alive := make(map[peer.ID]bool, len(peers))
+		var mu sync.Mutex
+		var wg sync.WaitGroup
+		for _, p := range peers {
+			wg.Add(1)
+			go func(p peer.ID) {
+				defer wg.Done()
+				pctx, cancel := context.WithTimeout(ctx, peerPingTimeout)
+				defer cancel()
+				// The channel closes without a result if the ping is cut off by the timeout
+				res, ok := <-ping.Ping(pctx, s.host, p)
+				mu.Lock()
+				alive[p] = ok && res.Error == nil
+				mu.Unlock()
+			}(p)
+		}
+		wg.Wait()
+
+		for p := range failures {
+			if _, connected := alive[p]; !connected {
+				delete(failures, p)
+			}
+		}
+		for p, ok := range alive {
+			if ok {
+				delete(failures, p)
+				continue
+			}
+			failures[p]++
+			if failures[p] >= peerMaxPingFailures {
+				log.Printf("Peer %s stopped answering pings; closing connection", p)
+				_ = s.host.Network().ClosePeer(p)
+				delete(failures, p)
+			}
+		}
+	}
 }
 
 // ConnectPeer parses incoming address representations (raw multiaddr, comma-delimited list,
@@ -454,13 +608,23 @@ func Start(cfg Config) (*NodeService, error) {
 	store := api.NewMessageStore()
 
 	svc := &NodeService{
-		host:      h,
-		transport: nodeTransport,
-		store:     store,
-		p2pPort:   cfg.P2PPort,
-		cancel:    cancel,
-		done:      make(chan struct{}),
+		host:        h,
+		transport:   nodeTransport,
+		store:       store,
+		p2pPort:     cfg.P2PPort,
+		cancel:      cancel,
+		done:        make(chan struct{}),
+		peerHandles: make(map[peer.ID]string),
 	}
+
+	// Exchange handles with every peer as soon as a connection comes up
+	h.SetStreamHandler(profileProtocol, svc.handleProfileStream)
+	h.Network().Notify(&network.NotifyBundle{
+		ConnectedF: func(_ network.Network, c network.Conn) {
+			go svc.sendProfile(c.RemotePeer())
+		},
+	})
+	go svc.monitorPeers(ctx)
 
 	// Initialize and start mDNS peer auto-discovery for local Wi-Fi / Hotspot
 	notifee := &mdnsNotifee{h: h, ctx: ctx}

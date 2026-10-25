@@ -6,6 +6,7 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -252,5 +253,86 @@ func TestFreshSimultaneousConnect(t *testing.T) {
 		os.RemoveAll(tempDir1)
 		os.RemoveAll(tempDir2)
 		time.Sleep(100 * time.Millisecond)
+	}
+}
+
+func waitForPeerHandle(t *testing.T, svc *node.NodeService, peerID, want string) {
+	t.Helper()
+	deadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) {
+		for _, p := range svc.Peers() {
+			if p.ID == peerID && p.Handle == want {
+				return
+			}
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+	t.Fatalf("node %s never saw handle %q for peer %s (peers: %+v)", svc.ID(), want, peerID, svc.Peers())
+}
+
+func TestHandleExchange(t *testing.T) {
+	svc1, err := node.Start(node.Config{DataDir: t.TempDir(), HTTPPort: 9101, P2PPort: 5101})
+	if err != nil {
+		t.Fatalf("failed to start node 1: %v", err)
+	}
+	defer svc1.Stop()
+	svc2, err := node.Start(node.Config{DataDir: t.TempDir(), HTTPPort: 9102, P2PPort: 5102})
+	if err != nil {
+		t.Fatalf("failed to start node 2: %v", err)
+	}
+	defer svc2.Stop()
+
+	// Node 1 sets its handle over HTTP, as the app does
+	resp, err := http.Post("http://127.0.0.1:9101/profile", "application/json",
+		strings.NewReader(`{"handle":"alice"}`))
+	if err != nil || resp.StatusCode != http.StatusOK {
+		t.Fatalf("POST /profile failed: %v (status %v)", err, resp)
+	}
+	resp.Body.Close()
+	if err := svc2.SetHandle("bob"); err != nil {
+		t.Fatalf("SetHandle failed: %v", err)
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	if err := svc2.ConnectPeer(ctx, svc1.Addrs()[0]); err != nil {
+		t.Fatalf("connect failed: %v", err)
+	}
+
+	// Each side learns the other's handle once connected
+	waitForPeerHandle(t, svc1, svc2.ID(), "bob")
+	waitForPeerHandle(t, svc2, svc1.ID(), "alice")
+
+	// A rename reaches peers that are already connected
+	if err := svc1.SetHandle("alice2"); err != nil {
+		t.Fatalf("SetHandle failed: %v", err)
+	}
+	waitForPeerHandle(t, svc2, svc1.ID(), "alice2")
+
+	// Handles are exposed over HTTP for the app
+	resp, err = http.Get("http://127.0.0.1:9102/peers")
+	if err != nil {
+		t.Fatalf("GET /peers failed: %v", err)
+	}
+	var peers struct {
+		Peers []struct {
+			ID     string `json:"id"`
+			Handle string `json:"handle"`
+		} `json:"peers"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&peers); err != nil {
+		t.Fatalf("decode /peers: %v", err)
+	}
+	resp.Body.Close()
+	found := false
+	for _, p := range peers.Peers {
+		found = found || (p.ID == svc1.ID() && p.Handle == "alice2")
+	}
+	if !found {
+		t.Fatalf("/peers on node 2 lacks alice2: %+v", peers.Peers)
+	}
+
+	if err := svc1.SetHandle(strings.Repeat("x", 33)); err == nil {
+		t.Fatal("expected an over-long handle to be rejected")
 	}
 }

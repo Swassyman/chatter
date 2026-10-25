@@ -30,9 +30,48 @@ func (s *Server) handleNode(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	writeJSON(w, http.StatusOK, map[string]interface{}{
+	resp := map[string]interface{}{
 		"id":    s.node.ID(),
 		"addrs": s.node.Addrs(),
+	}
+	if pn, ok := s.node.(ProfileNode); ok {
+		resp["handle"] = pn.Handle()
+	}
+	writeJSON(w, http.StatusOK, resp)
+}
+
+type ProfileRequest struct {
+	Handle string `json:"handle"`
+}
+
+// handleProfile reads (GET) or sets (POST) this node's handle.
+func (s *Server) handleProfile(w http.ResponseWriter, r *http.Request) {
+	pn, ok := s.node.(ProfileNode)
+	if !ok {
+		http.Error(w, "profiles not supported", http.StatusNotImplemented)
+		return
+	}
+
+	switch r.Method {
+	case http.MethodGet:
+	case http.MethodPost:
+		var req ProfileRequest
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			http.Error(w, "invalid JSON", http.StatusBadRequest)
+			return
+		}
+		if err := pn.SetHandle(req.Handle); err != nil {
+			http.Error(w, err.Error(), http.StatusBadRequest)
+			return
+		}
+	default:
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	writeJSON(w, http.StatusOK, map[string]string{
+		"id":     s.node.ID(),
+		"handle": pn.Handle(),
 	})
 }
 

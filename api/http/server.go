@@ -6,7 +6,15 @@ import (
 )
 
 type Peer struct {
-	ID string `json:"id"`
+	ID     string `json:"id"`
+	Handle string `json:"handle,omitempty"`
+}
+
+// ProfileNode is implemented by nodes that carry a user-chosen handle and
+// share it with their peers.
+type ProfileNode interface {
+	Handle() string
+	SetHandle(handle string) error
 }
 
 // Node is the interface the HTTP server uses to interact with the p2p node.
@@ -45,6 +53,7 @@ func (s *Server) registerRoutes() {
 	s.mux.HandleFunc("/message", s.handleMessage)
 	s.mux.HandleFunc("/peers/connect", s.handleConnectPeer)
 	s.mux.HandleFunc("/messages", s.handleMessages)
+	s.mux.HandleFunc("/profile", s.handleProfile)
 }
 
 func (s *Server) Start(addr string) error {
