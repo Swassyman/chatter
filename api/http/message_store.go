@@ -5,6 +5,10 @@ import (
 	"time"
 )
 
+// TimeFormat is RFC3339 to the millisecond. Whole seconds weren't enough: a
+// reply arriving in the same second as the message it answers sorted above it.
+const TimeFormat = "2006-01-02T15:04:05.000Z07:00"
+
 // ReceivedMessage holds a single incoming chat message with metadata.
 type ReceivedMessage struct {
 	ID        int    `json:"id"`
@@ -43,7 +47,7 @@ func NewMessageStore() *MessageStore {
 }
 
 // Add records a new message from the given peer with the given content,
-// assigning a monotonically increasing ID and an RFC3339 timestamp.
+// assigning a monotonically increasing ID and a timestamp (TimeFormat).
 func (ms *MessageStore) Add(from, content string) {
 	ms.AddMessage(ReceivedMessage{From: from, Content: content})
 }

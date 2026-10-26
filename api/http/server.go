@@ -3,6 +3,7 @@ package httpapi
 import (
 	"context"
 	"net/http"
+	"time"
 )
 
 type Peer struct {
@@ -75,6 +76,7 @@ func (s *Server) registerRoutes() {
 	s.mux.HandleFunc("/peers", s.handlePeers)
 	s.mux.HandleFunc("/message", s.handleMessage)
 	s.mux.HandleFunc("/peers/connect", s.handleConnectPeer)
+	s.mux.HandleFunc("/peers/discovered", s.handleDiscoveredPeers)
 	s.mux.HandleFunc("/messages", s.handleMessages)
 	s.mux.HandleFunc("/profile", s.handleProfile)
 	s.mux.HandleFunc("/receipts", s.handleReceipts)
