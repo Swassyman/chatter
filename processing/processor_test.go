@@ -1,9 +1,11 @@
 package processing
 
 import (
+	"bytes"
 	"context"
 	"crypto/rand"
 	"errors"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -176,11 +178,95 @@ func TestTamperedMessageRejected(t *testing.T) {
 	expectNothing(t, b)
 }
 
-func TestNoPeers(t *testing.T) {
+// Alone, a room message is kept rather than lost, and goes out to whoever
+// turns up first; they pass it on like any room message.
+func TestRoomMessageCarriedToLateArrivals(t *testing.T) {
+	fastCarry(t)
 	h := newHub()
-	a, _ := newNode(t, h, nil)
-	if err := a.SendRoom("r", "x"); !errors.Is(err, ErrNoPeers) {
-		t.Fatalf("want ErrNoPeers, got %v", err)
+	a, fa := newNode(t, h, nil)
+	b, fb := newNode(t, h, nil)
+	c, fc := newNode(t, h, nil)
+
+	if err := a.SendRoom("general", "water at the gym"); !errors.Is(err, ErrQueued) {
+		t.Fatalf("want ErrQueued, got %v", err)
+	}
+	h.link(fb.id, fc.id)
+	h.link(fa.id, fb.id)
+	for _, p := range []*Processor{b, c} {
+		if m := expect(t, p); m.Room != "general" || m.Content != "water at the gym" {
+			t.Fatalf("bad room message: %+v", m)
+		}
+	}
+	expectNothing(t, b)
+}
+
+// A ~ X ~ B ~ C ~ D. A and D share a private room; X only listens on the
+// wire, B relays without the key, C has the name but the wrong passphrase.
+func TestPrivateRoomOnlyReadableWithPassphrase(t *testing.T) {
+	h := newHub()
+	a, fa := newNode(t, h, nil)
+	b, fb := newNode(t, h, nil)
+	c, fc := newNode(t, h, nil)
+	d, fd := newNode(t, h, nil)
+	priv, _, _ := crypto.GenerateEd25519Key(rand.Reader)
+	xid, _ := peer.IDFromPrivateKey(priv)
+	fx := h.add(xid)
+	h.link(fa.id, fx.id)
+	h.link(fa.id, fb.id)
+	h.link(fb.id, fc.id)
+	h.link(fc.id, fd.id)
+
+	tag, err := a.JoinPrivateRoom("legal-aid", "blue heron 42")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if dTag, _ := d.JoinPrivateRoom("legal-aid", "blue heron 42"); dTag != tag {
+		t.Fatalf("same name and passphrase gave different tags: %s, %s", tag, dTag)
+	}
+	if cTag, _ := c.JoinPrivateRoom("legal-aid", "wrong guess"); cTag == tag {
+		t.Fatal("a different passphrase gave the same room")
+	}
+
+	if _, err := a.SendRoomWithID(tag, "", "lawyer at tent 7 until 6pm"); err != nil {
+		t.Fatal(err)
+	}
+	if m := expect(t, d); m.Content != "lawyer at tent 7 until 6pm" || m.Room != tag {
+		t.Fatalf("bad private room message: %+v", m)
+	}
+	expectNothing(t, b)
+	expectNothing(t, c)
+
+	// On the wire: neither the room's name nor the message
+	select {
+	case raw := <-fx.msgs:
+		if bytes.Contains(raw.Data, []byte("legal-aid")) || bytes.Contains(raw.Data, []byte("tent 7")) {
+			t.Fatalf("private room leaked on the wire: %s", raw.Data)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("observer saw nothing")
+	}
+}
+
+func TestRoomNamesAndMembershipChecked(t *testing.T) {
+	h := newHub()
+	a, fa := newNode(t, h, nil)
+	_, fb := newNode(t, h, nil)
+	h.link(fa.id, fb.id)
+
+	for _, bad := range []string{"", "General", "two words", "-x", strings.Repeat("a", 33)} {
+		if _, err := a.SendRoomWithID(bad, "", "hi"); err == nil {
+			t.Errorf("room %q was accepted", bad)
+		}
+	}
+	_, tag, err := PrivateRoomKey("food-shelter", "pass")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := a.SendRoomWithID(tag, "", "hi"); !errors.Is(err, ErrUnknownRoom) {
+		t.Fatalf("posting to a private room without its key: %v", err)
+	}
+	if _, _, err := PrivateRoomKey("food-shelter", ""); err == nil {
+		t.Error("a private room without a passphrase was allowed")
 	}
 }
 

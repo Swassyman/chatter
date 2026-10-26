@@ -232,6 +232,37 @@ func (s *NodeService) SendChat(peerID, msgID, content string) (string, error) {
 	return s.proc.SendDirectWithID(to, msgID, content)
 }
 
+// SendRoom posts content to a room (an open room's name, or the tag JoinRoom
+// returned for a private one) under msgID (generated when empty), relayed to
+// everyone in range and carried for those who come later.
+func (s *NodeService) SendRoom(room, msgID, content string) (string, error) {
+	if len(content) > chatter.MAX_MESSAGE_SIZE {
+		return "", fmt.Errorf("message too large")
+	}
+	return s.proc.SendRoomWithID(room, msgID, content)
+}
+
+// JoinRoom returns the ID a room goes by: an open room's own name, or for a
+// private one (passphrase set) the tag derived from its key, which this
+// node can then read and post in.
+func (s *NodeService) JoinRoom(name, passphrase string) (string, error) {
+	if passphrase == "" {
+		if !processing.ValidRoomName(name) {
+			return "", fmt.Errorf("room names are lowercase letters, digits and dashes, up to 32 characters")
+		}
+		return name, nil
+	}
+	return s.proc.JoinPrivateRoom(name, passphrase)
+}
+
+// LeaveRoom stops reading a private room. Open rooms need no leaving: the
+// node relays every room and the app shows the ones it has joined.
+func (s *NodeService) LeaveRoom(room string) {
+	if processing.IsPrivateRoom(room) {
+		s.proc.LeavePrivateRoom(room)
+	}
+}
+
 // SendReceipt tells peerID that we received or read the given messages.
 func (s *NodeService) SendReceipt(peerID string, msgIDs []string, status string) error {
 	return s.proc.SendReceipt(peerID, msgIDs, status)
@@ -713,7 +744,7 @@ func Start(cfg Config) (*NodeService, error) {
 			case m := <-svc.proc.Incoming():
 				log.Printf("Received message %s from %s via %s", m.ID, m.From, m.Via)
 				store.AddMessage(api.ReceivedMessage{
-					From: m.From, Content: m.Content, MsgID: m.ID, Handle: m.Handle, Via: m.Via,
+					From: m.From, Content: m.Content, MsgID: m.ID, Handle: m.Handle, Via: m.Via, Room: m.Room,
 				})
 				if pid, err := peer.Decode(m.From); err == nil && m.Handle != "" {
 					svc.profileMu.Lock()

@@ -15,6 +15,7 @@ type ReceivedMessage struct {
 	MsgID  string `json:"msg_id,omitempty"` // mesh message ID, referenced by receipts
 	Handle string `json:"handle,omitempty"` // sender's handle, signed by the sender
 	Via    string `json:"via,omitempty"`    // neighbour it arrived from; differs from From when relayed
+	Room   string `json:"room,omitempty"`   // set for room posts: the room's name, or a private room's tag
 }
 
 // ReceivedReceipt reports that peer From received or read our messages.

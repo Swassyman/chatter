@@ -106,6 +106,7 @@ func (s *Server) handleDiscoveredPeers(w http.ResponseWriter, r *http.Request) {
 
 type SendMessageRequest struct {
 	PeerID  string `json:"peer_id"`
+	Room    string `json:"room,omitempty"` // post to this room instead of a peer
 	Content string `json:"content"`
 	ID      string `json:"id,omitempty"` // optional message ID chosen by the app
 }
@@ -122,8 +123,8 @@ func (s *Server) handleMessage(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if req.PeerID == "" {
-		http.Error(w, "peer_id is required", http.StatusBadRequest)
+	if req.PeerID == "" && req.Room == "" {
+		http.Error(w, "peer_id or room is required", http.StatusBadRequest)
 		return
 	}
 
@@ -134,7 +135,14 @@ func (s *Server) handleMessage(w http.ResponseWriter, r *http.Request) {
 
 	id := req.ID
 	var err error
-	if mn, ok := s.node.(MeshNode); ok {
+	if req.Room != "" {
+		rn, ok := s.node.(RoomNode)
+		if !ok {
+			http.Error(w, "rooms not supported", http.StatusNotImplemented)
+			return
+		}
+		id, err = rn.SendRoom(req.Room, req.ID, req.Content)
+	} else if mn, ok := s.node.(MeshNode); ok {
 		id, err = mn.SendChat(req.PeerID, req.ID, req.Content)
 	} else {
 		err = s.node.SendMessage(req.PeerID, req.Content)
@@ -154,9 +162,52 @@ func (s *Server) handleMessage(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, code, map[string]interface{}{
 		"status":  status,
 		"peer_id": req.PeerID,
+		"room":    req.Room,
 		"content": req.Content,
 		"id":      id,
 	})
+}
+
+type RoomRequest struct {
+	Name       string `json:"name"`
+	Passphrase string `json:"passphrase,omitempty"` // set for a private room
+	Room       string `json:"room,omitempty"`       // DELETE: the room's ID
+}
+
+// handleRooms joins a room (POST, returns the ID it goes by: its name, or a
+// private room's tag) or leaves one (DELETE). Every room is relayed either
+// way; joining a private room is what lets this node read it.
+func (s *Server) handleRooms(w http.ResponseWriter, r *http.Request) {
+	rn, ok := s.node.(RoomNode)
+	if !ok {
+		http.Error(w, "rooms not supported", http.StatusNotImplemented)
+		return
+	}
+	var req RoomRequest
+	if r.Method == http.MethodPost || r.Method == http.MethodDelete {
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			http.Error(w, "invalid JSON", http.StatusBadRequest)
+			return
+		}
+	}
+	switch r.Method {
+	case http.MethodPost:
+		room, err := rn.JoinRoom(req.Name, req.Passphrase)
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusBadRequest)
+			return
+		}
+		writeJSON(w, http.StatusOK, map[string]interface{}{
+			"name":    req.Name,
+			"room":    room,
+			"private": req.Passphrase != "",
+		})
+	case http.MethodDelete:
+		rn.LeaveRoom(req.Room)
+		writeJSON(w, http.StatusOK, map[string]string{"status": "left"})
+	default:
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+	}
 }
 
 type ReceiptRequest struct {

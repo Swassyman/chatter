@@ -38,6 +38,12 @@ func (queuedError) Queued() bool  { return true }
 const (
 	carryFor   = 24 * time.Hour
 	maxCarried = 500
+
+	// Room messages are carried too, so someone who walks into range later
+	// still gets the last few hours of a channel. They get a budget of their
+	// own, so a busy channel can't push out someone's direct messages.
+	carryRoomFor      = 6 * time.Hour
+	maxCarriedInRooms = 200
 )
 
 // How often to look for neighbours that arrived since the last look.
@@ -85,6 +91,8 @@ type Processor struct {
 	carry   map[string]carried
 	known   map[peer.ID]bool // neighbours at the last carry check; carry loop only
 
+	rooms roomKeys // private rooms we're in, by wire tag
+
 	handleMu sync.RWMutex
 	handle   string
 
@@ -128,6 +136,7 @@ func New(cfg Config) (*Processor, error) {
 		seen:     newSeenCache(carryFor, 10000),
 		carry:    map[string]carried{},
 		known:    map[peer.ID]bool{},
+		rooms:    roomKeys{byID: map[string]*AESGCM{}},
 		peers:    newPeerTable(),
 		incoming: make(chan ChatMessage, 64),
 		receipts: make(chan Receipt, 64),
@@ -237,8 +246,18 @@ func (p *Processor) SendDirectWithID(to peer.ID, id, content string) (string, er
 
 // SendRoom broadcasts to everyone reachable (gossip flood, TTL-limited).
 func (p *Processor) SendRoom(room, content string) error {
-	_, err := p.publish("", "", room, content)
+	_, err := p.SendRoomWithID(room, "", content)
 	return err
+}
+
+// SendRoomWithID is SendRoom with a caller-chosen message ID (generated when
+// empty). room is an open room's name or a joined private room's tag. With
+// no one in range it returns ErrQueued: the message is carried until someone is.
+func (p *Processor) SendRoomWithID(room, id, content string) (string, error) {
+	if !validRoomField(room) {
+		return "", fmt.Errorf("invalid room %q", room)
+	}
+	return p.publish(id, "", room, content)
 }
 
 // SendReceipt tells peer `to` that we received or read the given messages.
@@ -292,7 +311,18 @@ func (p *Processor) publish(id, to, room, content string) (string, error) {
 	if content == "" {
 		return "", errors.New("empty message")
 	}
-	env, err := p.newEnvelope(id, TypeChat, to, room, []byte(content))
+	payload := []byte(content)
+	if IsPrivateRoom(room) {
+		c := p.rooms.get(room)
+		if c == nil {
+			return "", ErrUnknownRoom
+		}
+		var err error
+		if payload, err = c.Encrypt(payload); err != nil {
+			return "", fmt.Errorf("encrypt for room: %w", err)
+		}
+	}
+	env, err := p.newEnvelope(id, TypeChat, to, room, payload)
 	if err != nil {
 		return "", err
 	}
@@ -372,7 +402,7 @@ func (p *Processor) route(env *Envelope, exclude peer.ID) error {
 		}
 	}
 
-	if env.To != "" {
+	if env.To != "" || env.Room != "" {
 		p.keep(env)
 	}
 
@@ -389,7 +419,7 @@ func (p *Processor) route(env *Envelope, exclude peer.ID) error {
 		}(n)
 	}
 	if sent == 0 {
-		if env.To != "" {
+		if env.To != "" || env.Room != "" {
 			return ErrQueued
 		}
 		return ErrNoPeers
@@ -397,22 +427,34 @@ func (p *Processor) route(env *Envelope, exclude peer.ID) error {
 	return nil
 }
 
+// keep carries env until it expires. Addressed messages and room messages
+// each have a budget; at its limit, the one of the same kind closest to
+// expiring makes way.
 func (p *Processor) keep(env *Envelope) {
 	p.carryMu.Lock()
 	defer p.carryMu.Unlock()
 	if _, ok := p.carry[env.ID]; ok {
 		return
 	}
-	if len(p.carry) >= maxCarried { // make room by dropping the one closest to expiring
-		var oldest string
-		for id, c := range p.carry {
-			if oldest == "" || c.until.Before(p.carry[oldest].until) {
-				oldest = id
-			}
+	inRoom := env.To == ""
+	limit, ttl := maxCarried, carryFor
+	if inRoom {
+		limit, ttl = maxCarriedInRooms, carryRoomFor
+	}
+	count, oldest := 0, ""
+	for id, c := range p.carry {
+		if (c.env.To == "") != inRoom {
+			continue
 		}
+		count++
+		if oldest == "" || c.until.Before(p.carry[oldest].until) {
+			oldest = id
+		}
+	}
+	if count >= limit {
 		delete(p.carry, oldest)
 	}
-	p.carry[env.ID] = carried{env: env, until: time.Now().Add(carryFor)}
+	p.carry[env.ID] = carried{env: env, until: time.Now().Add(ttl)}
 }
 
 func (p *Processor) forget(id string) {
@@ -526,6 +568,18 @@ func (p *Processor) deliver(env *Envelope, via peer.ID) {
 		pt, err := p.cipher.Decrypt(payload)
 		if err != nil {
 			log.Printf("processing: cannot decrypt %s: %v", env.ID, err)
+			return
+		}
+		payload = pt
+	}
+	if IsPrivateRoom(env.Room) {
+		c := p.rooms.get(env.Room)
+		if c == nil {
+			return // not our room: relayed (see handleRaw), never read
+		}
+		pt, err := c.Decrypt(payload)
+		if err != nil {
+			log.Printf("processing: cannot open %s in a private room: %v", env.ID, err)
 			return
 		}
 		payload = pt

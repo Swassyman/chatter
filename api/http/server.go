@@ -26,6 +26,16 @@ type MeshNode interface {
 	SendReceipt(peerID string, msgIDs []string, status string) error
 }
 
+// RoomNode is implemented by nodes with mesh channels: broadcast rooms that
+// every node relays, some of them private (passphrase-keyed).
+type RoomNode interface {
+	// SendRoom posts under msgID (generated when empty) and returns the ID used.
+	SendRoom(room, msgID, content string) (string, error)
+	// JoinRoom returns the room's ID: its name if open, or a private room's tag.
+	JoinRoom(name, passphrase string) (string, error)
+	LeaveRoom(room string)
+}
+
 // BridgeFrame is a mesh frame travelling over a Bluetooth link the app owns.
 type BridgeFrame struct {
 	To   string `json:"to"`
@@ -94,6 +104,7 @@ func (s *Server) registerRoutes() {
 	s.mux.HandleFunc("/messages", s.handleMessages)
 	s.mux.HandleFunc("/profile", s.handleProfile)
 	s.mux.HandleFunc("/receipts", s.handleReceipts)
+	s.mux.HandleFunc("/rooms", s.handleRooms)
 	s.mux.HandleFunc("/bt/peers", s.handleBluetoothPeers)
 	s.mux.HandleFunc("/bt/outbox", s.handleBluetoothOutbox)
 	s.mux.HandleFunc("/bt/inbox", s.handleBluetoothInbox)

@@ -91,6 +91,8 @@ func Decode(b []byte) (*Envelope, error) {
 		return nil, fmt.Errorf("unknown message type %q", e.Type)
 	case e.TTL < 0 || e.TTL > MaxTTL:
 		return nil, fmt.Errorf("invalid ttl %d", e.TTL)
+	case e.Room != "" && (e.To != "" || !validRoomField(e.Room)):
+		return nil, fmt.Errorf("invalid room %q", e.Room)
 	case len(e.Sig) == 0:
 		return nil, errors.New("envelope is unsigned")
 	}
