@@ -51,8 +51,6 @@ type Envelope struct {
 	Sig       []byte  `json:"sig"`            // signature by From's key
 }
 
-func isHistory(t MsgType) bool { return t == TypeHistoryRequest || t == TypeHistoryResponse }
-
 func newID() (string, error) {
 	b := make([]byte, 16)
 	if _, err := rand.Read(b); err != nil {
@@ -89,12 +87,10 @@ func Decode(b []byte) (*Envelope, error) {
 		return nil, errors.New("invalid envelope id")
 	case e.From == "":
 		return nil, errors.New("envelope has no sender")
-	case e.Type != TypeChat && e.Type != TypeReceipt && !isHistory(e.Type):
+	case e.Type != TypeChat && e.Type != TypeReceipt:
 		return nil, fmt.Errorf("unknown message type %q", e.Type)
 	case e.TTL < 0 || e.TTL > MaxTTL:
 		return nil, fmt.Errorf("invalid ttl %d", e.TTL)
-	case e.Room != "" && (e.To != "" || !validRoomField(e.Room)):
-		return nil, fmt.Errorf("invalid room %q", e.Room)
 	case len(e.Sig) == 0:
 		return nil, errors.New("envelope is unsigned")
 	}

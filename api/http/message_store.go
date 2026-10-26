@@ -14,16 +14,11 @@ type ReceivedMessage struct {
 	ID        int    `json:"id"`
 	From      string `json:"from"`
 	Content   string `json:"content"`
-	Timestamp string `json:"timestamp"` // RFC3339, to the millisecond (see TimeFormat)
+	Timestamp string `json:"timestamp"` // RFC3339 format
 
 	MsgID  string `json:"msg_id,omitempty"` // mesh message ID, referenced by receipts
 	Handle string `json:"handle,omitempty"` // sender's handle, signed by the sender
 	Via    string `json:"via,omitempty"`    // neighbour it arrived from; differs from From when relayed
-	Room   string `json:"room,omitempty"`   // set for room posts: the room's name, or a private room's tag
-
-	// History is set for a room post caught up from a neighbour's history,
-	// whose Timestamp is then when its author wrote it.
-	History bool `json:"history,omitempty"`
 }
 
 // ReceivedReceipt reports that peer From received or read our messages.
@@ -57,15 +52,13 @@ func (ms *MessageStore) Add(from, content string) {
 	ms.AddMessage(ReceivedMessage{From: from, Content: content})
 }
 
-// AddMessage records m, assigning its ID, and its timestamp unless it has one.
+// AddMessage records m, assigning its ID and timestamp.
 func (ms *MessageStore) AddMessage(m ReceivedMessage) {
 	ms.mu.Lock()
 	defer ms.mu.Unlock()
 
 	m.ID = ms.nextID
-	if m.Timestamp == "" {
-		m.Timestamp = time.Now().UTC().Format(TimeFormat)
-	}
+	m.Timestamp = time.Now().UTC().Format(time.RFC3339)
 	ms.messages = append(ms.messages, m)
 	ms.nextID++
 }
@@ -96,7 +89,7 @@ func (ms *MessageStore) AddReceipt(from, via string, ids []string, status string
 		From:      from,
 		IDs:       ids,
 		Status:    status,
-		Timestamp: time.Now().UTC().Format(TimeFormat),
+		Timestamp: time.Now().UTC().Format(time.RFC3339),
 		Via:       via,
 	})
 	ms.nextReceiptID++
