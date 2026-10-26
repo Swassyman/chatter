@@ -16,6 +16,7 @@ type ChatMessage struct {
 	Outgoing  bool
 	Handle    string // author's display name, as signed by the author
 	Via       string // neighbour it arrived from; differs from From when relayed
+	History   bool   // caught up from a neighbour's room history, not received live
 }
 
 // Receipt reports that peer From received or read our messages IDs.

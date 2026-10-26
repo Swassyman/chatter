@@ -16,6 +16,10 @@ type ReceivedMessage struct {
 	Handle string `json:"handle,omitempty"` // sender's handle, signed by the sender
 	Via    string `json:"via,omitempty"`    // neighbour it arrived from; differs from From when relayed
 	Room   string `json:"room,omitempty"`   // set for room posts: the room's name, or a private room's tag
+
+	// History is set for a room post caught up from a neighbour's history,
+	// whose Timestamp is then when its author wrote it.
+	History bool `json:"history,omitempty"`
 }
 
 // ReceivedReceipt reports that peer From received or read our messages.
@@ -49,13 +53,15 @@ func (ms *MessageStore) Add(from, content string) {
 	ms.AddMessage(ReceivedMessage{From: from, Content: content})
 }
 
-// AddMessage records m, assigning its ID and timestamp.
+// AddMessage records m, assigning its ID, and its timestamp unless it has one.
 func (ms *MessageStore) AddMessage(m ReceivedMessage) {
 	ms.mu.Lock()
 	defer ms.mu.Unlock()
 
 	m.ID = ms.nextID
-	m.Timestamp = time.Now().UTC().Format(time.RFC3339)
+	if m.Timestamp == "" {
+		m.Timestamp = time.Now().UTC().Format(time.RFC3339)
+	}
 	ms.messages = append(ms.messages, m)
 	ms.nextID++
 }

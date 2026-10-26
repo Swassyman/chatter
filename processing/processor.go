@@ -91,7 +91,8 @@ type Processor struct {
 	carry   map[string]carried
 	known   map[peer.ID]bool // neighbours at the last carry check; carry loop only
 
-	rooms roomKeys // private rooms we're in, by wire tag
+	rooms   roomKeys     // private rooms we're in, by wire tag
+	history *roomHistory // recent room posts, for neighbours catching up
 
 	handleMu sync.RWMutex
 	handle   string
@@ -137,6 +138,7 @@ func New(cfg Config) (*Processor, error) {
 		carry:    map[string]carried{},
 		known:    map[peer.ID]bool{},
 		rooms:    roomKeys{byID: map[string]*AESGCM{}},
+		history:  newRoomHistory(),
 		peers:    newPeerTable(),
 		incoming: make(chan ChatMessage, 64),
 		receipts: make(chan Receipt, 64),
@@ -330,6 +332,7 @@ func (p *Processor) publish(id, to, room, content string) (string, error) {
 		ID: env.ID, From: env.From, To: to, Room: room, Content: content,
 		Timestamp: time.UnixMilli(env.Timestamp), Outgoing: true, Handle: env.Handle,
 	})
+	p.history.record(env)
 	return env.ID, p.route(env, "")
 }
 
@@ -481,6 +484,10 @@ func (p *Processor) offerCarried() {
 	if len(fresh) == 0 {
 		return
 	}
+	// Someone new in range may have heard what our rooms said before we came
+	for _, n := range fresh {
+		go p.requestHistoryFrom(n)
+	}
 
 	now := time.Now()
 	var envs []*Envelope
@@ -526,12 +533,14 @@ func (p *Processor) handleRaw(m transport.Message) {
 		return // duplicate
 	}
 	p.peers.Touch(m.From)
+	p.history.record(env)
 
 	self := p.self.String()
 	if env.To == "" || env.To == self {
 		p.deliver(env, m.From)
 	}
-	if env.To != self && env.TTL > 1 {
+	// History requests and answers are for one neighbour, never passed on
+	if env.To != self && env.TTL > 1 && !isHistory(env.Type) {
 		fwd := *env
 		fwd.TTL--
 		go func() {
@@ -562,7 +571,11 @@ func verify(env *Envelope) error {
 	return nil
 }
 
-func (p *Processor) deliver(env *Envelope, via peer.ID) {
+func (p *Processor) deliver(env *Envelope, via peer.ID) { p.deliverWith(env, via, false) }
+
+// deliverWith hands env to the app; fromHistory marks a post that arrived in
+// a history answer rather than as it was sent.
+func (p *Processor) deliverWith(env *Envelope, via peer.ID, fromHistory bool) {
 	payload := env.Payload
 	if p.cipher != nil {
 		pt, err := p.cipher.Decrypt(payload)
@@ -571,6 +584,10 @@ func (p *Processor) deliver(env *Envelope, via peer.ID) {
 			return
 		}
 		payload = pt
+	}
+	if isHistory(env.Type) {
+		p.handleHistory(env, payload, via)
+		return
 	}
 	if IsPrivateRoom(env.Room) {
 		c := p.rooms.get(env.Room)
@@ -602,7 +619,7 @@ func (p *Processor) deliver(env *Envelope, via peer.ID) {
 	msg := ChatMessage{
 		ID: env.ID, From: env.From, To: env.To, Room: env.Room,
 		Content: string(payload), Timestamp: time.UnixMilli(env.Timestamp),
-		Handle: env.Handle, Via: via.String(),
+		Handle: env.Handle, Via: via.String(), History: fromHistory,
 	}
 	_ = p.store.Save(msg)
 	select {

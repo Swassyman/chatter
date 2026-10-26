@@ -176,7 +176,8 @@ type RoomRequest struct {
 
 // handleRooms joins a room (POST, returns the ID it goes by: its name, or a
 // private room's tag) or leaves one (DELETE). Every room is relayed either
-// way; joining a private room is what lets this node read it.
+// way; joining a private room is what lets this node read it, and joining
+// any room asks neighbours for its recent posts.
 func (s *Server) handleRooms(w http.ResponseWriter, r *http.Request) {
 	rn, ok := s.node.(RoomNode)
 	if !ok {

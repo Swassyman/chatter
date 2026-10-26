@@ -244,20 +244,28 @@ func (s *NodeService) SendRoom(room, msgID, content string) (string, error) {
 
 // JoinRoom returns the ID a room goes by: an open room's own name, or for a
 // private one (passphrase set) the tag derived from its key, which this
-// node can then read and post in.
+// node can then read and post in. Either way neighbours are asked for the
+// room's recent posts, and so is everyone met while the app stays in it.
 func (s *NodeService) JoinRoom(name, passphrase string) (string, error) {
+	room := name
 	if passphrase == "" {
 		if !processing.ValidRoomName(name) {
 			return "", fmt.Errorf("room names are lowercase letters, digits and dashes, up to 32 characters")
 		}
-		return name, nil
+	} else {
+		var err error
+		if room, err = s.proc.JoinPrivateRoom(name, passphrase); err != nil {
+			return "", err
+		}
 	}
-	return s.proc.JoinPrivateRoom(name, passphrase)
+	s.proc.SubscribeRoom(room)
+	return room, nil
 }
 
-// LeaveRoom stops reading a private room. Open rooms need no leaving: the
-// node relays every room and the app shows the ones it has joined.
+// LeaveRoom stops catching up on a room, and stops reading it if private.
+// Its posts are still relayed for others, as every room's are.
 func (s *NodeService) LeaveRoom(room string) {
+	s.proc.UnsubscribeRoom(room)
 	if processing.IsPrivateRoom(room) {
 		s.proc.LeavePrivateRoom(room)
 	}
@@ -743,9 +751,15 @@ func Start(cfg Config) (*NodeService, error) {
 			select {
 			case m := <-svc.proc.Incoming():
 				log.Printf("Received message %s from %s via %s", m.ID, m.From, m.Via)
-				store.AddMessage(api.ReceivedMessage{
+				received := api.ReceivedMessage{
 					From: m.From, Content: m.Content, MsgID: m.ID, Handle: m.Handle, Via: m.Via, Room: m.Room,
-				})
+				}
+				if m.History {
+					// Caught up from a neighbour: when it was written, not now
+					received.History = true
+					received.Timestamp = m.Timestamp.UTC().Format(time.RFC3339)
+				}
+				store.AddMessage(received)
 				if pid, err := peer.Decode(m.From); err == nil && m.Handle != "" {
 					svc.profileMu.Lock()
 					svc.peerHandles[pid] = m.Handle
