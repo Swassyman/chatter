@@ -65,10 +65,6 @@ type Config struct {
 
 	// DisableMDNS turns off LAN auto-discovery, e.g. so tests control topology
 	DisableMDNS bool
-
-	// PexLoopback lets peer exchange share and dial 127.0.0.1 addresses, for
-	// tests that run every node on one machine
-	PexLoopback bool
 }
 
 // NodeService encapsulates the libp2p host, transport, message store, HTTP server, and mDNS discovery.
@@ -91,8 +87,6 @@ type NodeService struct {
 	profileMu   sync.RWMutex
 	handle      string
 	peerHandles map[peer.ID]string
-
-	pex *pexState
 }
 
 type mdnsNotifee struct {
@@ -230,45 +224,6 @@ func (s *NodeService) SendChat(peerID, msgID, content string) (string, error) {
 		return "", fmt.Errorf("message too large")
 	}
 	return s.proc.SendDirectWithID(to, msgID, content)
-}
-
-// SendRoom posts content to a room (an open room's name, or the tag JoinRoom
-// returned for a private one) under msgID (generated when empty), relayed to
-// everyone in range and carried for those who come later.
-func (s *NodeService) SendRoom(room, msgID, content string) (string, error) {
-	if len(content) > chatter.MAX_MESSAGE_SIZE {
-		return "", fmt.Errorf("message too large")
-	}
-	return s.proc.SendRoomWithID(room, msgID, content)
-}
-
-// JoinRoom returns the ID a room goes by: an open room's own name, or for a
-// private one (passphrase set) the tag derived from its key, which this
-// node can then read and post in. Either way neighbours are asked for the
-// room's recent posts, and so is everyone met while the app stays in it.
-func (s *NodeService) JoinRoom(name, passphrase string) (string, error) {
-	room := name
-	if passphrase == "" {
-		if !processing.ValidRoomName(name) {
-			return "", fmt.Errorf("room names are lowercase letters, digits and dashes, up to 32 characters")
-		}
-	} else {
-		var err error
-		if room, err = s.proc.JoinPrivateRoom(name, passphrase); err != nil {
-			return "", err
-		}
-	}
-	s.proc.SubscribeRoom(room)
-	return room, nil
-}
-
-// LeaveRoom stops catching up on a room, and stops reading it if private.
-// Its posts are still relayed for others, as every room's are.
-func (s *NodeService) LeaveRoom(room string) {
-	s.proc.UnsubscribeRoom(room)
-	if processing.IsPrivateRoom(room) {
-		s.proc.LeavePrivateRoom(room)
-	}
 }
 
 // SendReceipt tells peerID that we received or read the given messages.
@@ -717,21 +672,16 @@ func Start(cfg Config) (*NodeService, error) {
 		cancel:      cancel,
 		done:        make(chan struct{}),
 		peerHandles: make(map[peer.ID]string),
-		pex:         newPexState(cfg.PexLoopback),
 	}
 
-	// Exchange handles with every peer as soon as a connection comes up, and
-	// tell neighbours about the newcomer (and the newcomer about them)
+	// Exchange handles with every peer as soon as a connection comes up
 	h.SetStreamHandler(profileProtocol, svc.handleProfileStream)
-	h.SetStreamHandler(pexProtocol, svc.handlePexStream)
 	h.Network().Notify(&network.NotifyBundle{
 		ConnectedF: func(_ network.Network, c network.Conn) {
 			go svc.sendProfile(c.RemotePeer())
-			time.AfterFunc(pexAnnounceDelay, svc.announcePex)
 		},
 	})
 	go svc.monitorPeers(ctx)
-	go svc.pexLoop(ctx)
 
 	// Initialize and start mDNS peer auto-discovery for local Wi-Fi / Hotspot
 	if !cfg.DisableMDNS {
@@ -751,15 +701,9 @@ func Start(cfg Config) (*NodeService, error) {
 			select {
 			case m := <-svc.proc.Incoming():
 				log.Printf("Received message %s from %s via %s", m.ID, m.From, m.Via)
-				received := api.ReceivedMessage{
-					From: m.From, Content: m.Content, MsgID: m.ID, Handle: m.Handle, Via: m.Via, Room: m.Room,
-				}
-				if m.History {
-					// Caught up from a neighbour: when it was written, not now
-					received.History = true
-					received.Timestamp = m.Timestamp.UTC().Format(api.TimeFormat)
-				}
-				store.AddMessage(received)
+				store.AddMessage(api.ReceivedMessage{
+					From: m.From, Content: m.Content, MsgID: m.ID, Handle: m.Handle, Via: m.Via,
+				})
 				if pid, err := peer.Decode(m.From); err == nil && m.Handle != "" {
 					svc.profileMu.Lock()
 					svc.peerHandles[pid] = m.Handle
