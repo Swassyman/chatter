@@ -757,7 +757,7 @@ func Start(cfg Config) (*NodeService, error) {
 				if m.History {
 					// Caught up from a neighbour: when it was written, not now
 					received.History = true
-					received.Timestamp = m.Timestamp.UTC().Format(time.RFC3339)
+					received.Timestamp = m.Timestamp.UTC().Format(api.TimeFormat)
 				}
 				store.AddMessage(received)
 				if pid, err := peer.Decode(m.From); err == nil && m.Handle != "" {

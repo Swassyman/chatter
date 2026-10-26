@@ -5,12 +5,16 @@ import (
 	"time"
 )
 
+// TimeFormat is RFC3339 to the millisecond. Whole seconds weren't enough: a
+// reply arriving in the same second as the message it answers sorted above it.
+const TimeFormat = "2006-01-02T15:04:05.000Z07:00"
+
 // ReceivedMessage holds a single incoming chat message with metadata.
 type ReceivedMessage struct {
 	ID        int    `json:"id"`
 	From      string `json:"from"`
 	Content   string `json:"content"`
-	Timestamp string `json:"timestamp"` // RFC3339 format
+	Timestamp string `json:"timestamp"` // RFC3339, to the millisecond (see TimeFormat)
 
 	MsgID  string `json:"msg_id,omitempty"` // mesh message ID, referenced by receipts
 	Handle string `json:"handle,omitempty"` // sender's handle, signed by the sender
@@ -48,7 +52,7 @@ func NewMessageStore() *MessageStore {
 }
 
 // Add records a new message from the given peer with the given content,
-// assigning a monotonically increasing ID and an RFC3339 timestamp.
+// assigning a monotonically increasing ID and a timestamp (TimeFormat).
 func (ms *MessageStore) Add(from, content string) {
 	ms.AddMessage(ReceivedMessage{From: from, Content: content})
 }
@@ -60,7 +64,7 @@ func (ms *MessageStore) AddMessage(m ReceivedMessage) {
 
 	m.ID = ms.nextID
 	if m.Timestamp == "" {
-		m.Timestamp = time.Now().UTC().Format(time.RFC3339)
+		m.Timestamp = time.Now().UTC().Format(TimeFormat)
 	}
 	ms.messages = append(ms.messages, m)
 	ms.nextID++
@@ -92,7 +96,7 @@ func (ms *MessageStore) AddReceipt(from, via string, ids []string, status string
 		From:      from,
 		IDs:       ids,
 		Status:    status,
-		Timestamp: time.Now().UTC().Format(time.RFC3339),
+		Timestamp: time.Now().UTC().Format(TimeFormat),
 		Via:       via,
 	})
 	ms.nextReceiptID++
