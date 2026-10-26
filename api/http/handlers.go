@@ -89,6 +89,21 @@ func (s *Server) handlePeers(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
+// handleDiscoveredPeers lists peers our neighbours told us about.
+func (s *Server) handleDiscoveredPeers(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	peers := []DiscoveredPeer{}
+	if pn, ok := s.node.(PexNode); ok {
+		peers = pn.Discovered()
+	}
+	writeJSON(w, http.StatusOK, map[string]interface{}{
+		"peers": peers,
+	})
+}
+
 type SendMessageRequest struct {
 	PeerID  string `json:"peer_id"`
 	Content string `json:"content"`

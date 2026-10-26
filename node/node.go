@@ -65,6 +65,10 @@ type Config struct {
 
 	// DisableMDNS turns off LAN auto-discovery, e.g. so tests control topology
 	DisableMDNS bool
+
+	// PexLoopback lets peer exchange share and dial 127.0.0.1 addresses, for
+	// tests that run every node on one machine
+	PexLoopback bool
 }
 
 // NodeService encapsulates the libp2p host, transport, message store, HTTP server, and mDNS discovery.
@@ -87,6 +91,8 @@ type NodeService struct {
 	profileMu   sync.RWMutex
 	handle      string
 	peerHandles map[peer.ID]string
+
+	pex *pexState
 }
 
 type mdnsNotifee struct {
@@ -672,16 +678,21 @@ func Start(cfg Config) (*NodeService, error) {
 		cancel:      cancel,
 		done:        make(chan struct{}),
 		peerHandles: make(map[peer.ID]string),
+		pex:         newPexState(cfg.PexLoopback),
 	}
 
-	// Exchange handles with every peer as soon as a connection comes up
+	// Exchange handles with every peer as soon as a connection comes up, and
+	// tell neighbours about the newcomer (and the newcomer about them)
 	h.SetStreamHandler(profileProtocol, svc.handleProfileStream)
+	h.SetStreamHandler(pexProtocol, svc.handlePexStream)
 	h.Network().Notify(&network.NotifyBundle{
 		ConnectedF: func(_ network.Network, c network.Conn) {
 			go svc.sendProfile(c.RemotePeer())
+			time.AfterFunc(pexAnnounceDelay, svc.announcePex)
 		},
 	})
 	go svc.monitorPeers(ctx)
+	go svc.pexLoop(ctx)
 
 	// Initialize and start mDNS peer auto-discovery for local Wi-Fi / Hotspot
 	if !cfg.DisableMDNS {

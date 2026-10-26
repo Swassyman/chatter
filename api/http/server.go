@@ -3,6 +3,7 @@ package httpapi
 import (
 	"context"
 	"net/http"
+	"time"
 )
 
 type Peer struct {
@@ -40,6 +41,20 @@ type BridgeNode interface {
 	BluetoothInbox(from string, data []byte) error
 }
 
+// DiscoveredPeer is a peer a neighbour told us about (peer exchange): not
+// necessarily connected, but reachable at Addrs on that neighbour's network.
+type DiscoveredPeer struct {
+	ID    string    `json:"id"`
+	Addrs []string  `json:"addrs"`
+	Via   string    `json:"via"`
+	Seen  time.Time `json:"seen"`
+}
+
+// PexNode is implemented by nodes that learn about peers from their neighbours.
+type PexNode interface {
+	Discovered() []DiscoveredPeer
+}
+
 // Node is the interface the HTTP server uses to interact with the p2p node.
 type Node interface {
 	ID() string
@@ -75,6 +90,7 @@ func (s *Server) registerRoutes() {
 	s.mux.HandleFunc("/peers", s.handlePeers)
 	s.mux.HandleFunc("/message", s.handleMessage)
 	s.mux.HandleFunc("/peers/connect", s.handleConnectPeer)
+	s.mux.HandleFunc("/peers/discovered", s.handleDiscoveredPeers)
 	s.mux.HandleFunc("/messages", s.handleMessages)
 	s.mux.HandleFunc("/profile", s.handleProfile)
 	s.mux.HandleFunc("/receipts", s.handleReceipts)
